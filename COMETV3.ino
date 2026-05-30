@@ -91,7 +91,7 @@ constexpr uint16_t BUZZER_FREQ_HZ = 4000;
 // ============================================================================
 
 constexpr float ADC_REF_VOLTAGE = 3.3f;
-constexpr float R_TOP = 430000.0f;
+constexpr float R_TOP = 330000.0f;
 constexpr float R_BOTTOM = 100000.0f;
 constexpr float BATTERY_DIVIDER_RATIO = ((R_TOP + R_BOTTOM) / R_BOTTOM);
 
@@ -119,14 +119,14 @@ constexpr float     LAUNCH_ACCEL_DELTA_G       = 1.5f;
 constexpr uint32_t  LAUNCH_ACCEL_DWELL_MS      = 150;
 constexpr uint32_t  BASELINE_MIN_MS            = 1000;
 
-constexpr float     MAX_FALL_SPEED_FOR_DROGUE  = -60.0f;
-constexpr uint32_t  DROGUE_INEFFECTIVE_MS      = 400;
+constexpr float     MAX_FALL_SPEED_FOR_DROGUE  = -100.0f; // this is bad should make this much higher closer to 100
+constexpr uint32_t  DROGUE_INEFFECTIVE_MS      = 1000; // this should also be increased to about a second 
 
 // ============================================================================
 // Pyro Timing
 // ============================================================================
 
-constexpr uint16_t PYRO_PULSE_MS = 300;
+constexpr uint16_t PYRO_PULSE_MS = 300; // should confirm that this is a small enough dwell to not casue perm damg
 
 // ============================================================================
 // Telemetry
@@ -142,7 +142,7 @@ constexpr uint32_t TELEMETRY_PERIOD_MS = 100;  // 10 Hz
 // the IMU, barometer, battery, logger, and telemetry on separate schedules.
 
 constexpr uint32_t IMU_READ_PERIOD_MS     = 10;    // 100 Hz target
-constexpr uint32_t BARO_READ_PERIOD_MS    = 100;   // 10 Hz target
+constexpr uint32_t BARO_READ_PERIOD_MS    = 100;   // 10 Hz target if this can be increased that would be cool
 constexpr uint32_t BATTERY_READ_PERIOD_MS = 1000;  // 1 Hz target
 
 uint32_t lastImuReadMs = 0;
@@ -166,6 +166,34 @@ enum class FlightState : uint8_t {
 };
 
 FlightState state = FlightState::BOOT;
+
+// ============================================================================
+// Human-Readable Logged Events
+// ============================================================================
+// Event codes are packed into the upper byte of the existing uint16_t
+// eventFlags field. This keeps FlightLogRecord at 32 bytes while DUMPCSV can
+// append an easy-to-read event_note column.
+
+enum LogEventCode : uint8_t {
+  LOG_EVENT_NONE = 0,
+  LOG_EVENT_BOOT_READY = 1,
+  LOG_EVENT_RESET = 2,
+  LOG_EVENT_LAUNCH_ACCEL = 3,
+  LOG_EVENT_FORCED_LAUNCH = 4,
+  LOG_EVENT_ASCENT_LOCKOUT_END = 5,
+  LOG_EVENT_APOGEE_NEG_TREND = 6,
+  LOG_EVENT_DROGUE_APOGEE = 7,
+  LOG_EVENT_DROGUE_TIMER_BACKUP = 8,
+  LOG_EVENT_MAIN_ARMED_ALTITUDE = 9,
+  LOG_EVENT_MAIN_ALTITUDE_CROSS = 10,
+  LOG_EVENT_MAIN_TIMER_BACKUP = 11,
+  LOG_EVENT_MAIN_DROGUE_INEFFECTIVE = 12,
+  LOG_EVENT_SERIAL_TEST_DROGUE = 13,
+  LOG_EVENT_SERIAL_TEST_MAIN = 14,
+  LOG_EVENT_UNKNOWN = 255
+};
+
+uint8_t pendingLogEventCode = LOG_EVENT_NONE;
 
 // ============================================================================
 // Runtime Variables
@@ -288,6 +316,25 @@ const char* LOG_SLOT_FILES[LOG_SLOT_COUNT] = {
   "/flight0.bin",
   "/flight1.bin",
   "/flight2.bin"
+};
+
+// ============================================================================
+// Persistent COMET Settings
+// ============================================================================
+// These settings live in LittleFS next to the flight logs. They are only
+// rewritten when the user changes the selected altitude mode, not continuously
+// during flight.
+
+const char* COMET_SETTINGS_FILE = "/comet_settings.bin";
+constexpr uint32_t SETTINGS_MAGIC   = 0x434D4554UL;  // "CMET"
+constexpr uint16_t SETTINGS_VERSION = 1;
+
+struct __attribute__((packed)) CometSettings {
+  uint32_t magic;
+  uint16_t version;
+  uint8_t  mainAltMode;
+  uint8_t  reserved;
+  uint32_t crc;
 };
 
 // ============================================================================
@@ -429,6 +476,53 @@ const char* stateStr(FlightState s) {
   return "UNKNOWN";
 }
 
+uint8_t logEventCodeFromName(const char* eventName) {
+  if (!eventName || eventName[0] == '\0' || strcmp(eventName, "-") == 0) return LOG_EVENT_NONE;
+
+  if (strcmp(eventName, "BOOT_READY") == 0) return LOG_EVENT_BOOT_READY;
+  if (strcmp(eventName, "RESET") == 0) return LOG_EVENT_RESET;
+  if (strcmp(eventName, "LAUNCH_ACCEL") == 0) return LOG_EVENT_LAUNCH_ACCEL;
+  if (strcmp(eventName, "FORCED_LAUNCH") == 0) return LOG_EVENT_FORCED_LAUNCH;
+  if (strcmp(eventName, "ASCENT_LOCKOUT_END") == 0) return LOG_EVENT_ASCENT_LOCKOUT_END;
+  if (strcmp(eventName, "APOGEE_NEG_TREND") == 0) return LOG_EVENT_APOGEE_NEG_TREND;
+  if (strcmp(eventName, "APOGEE") == 0) return LOG_EVENT_DROGUE_APOGEE;
+  if (strcmp(eventName, "TIMER_BACKUP_DROGUE") == 0) return LOG_EVENT_DROGUE_TIMER_BACKUP;
+  if (strcmp(eventName, "MAIN_ARMED_ALTITUDE") == 0) return LOG_EVENT_MAIN_ARMED_ALTITUDE;
+  if (strcmp(eventName, "MAIN_AGL_CROSS") == 0) return LOG_EVENT_MAIN_ALTITUDE_CROSS;
+  if (strcmp(eventName, "TIMER_BACKUP_MAIN_AFTER_DROGUE") == 0) return LOG_EVENT_MAIN_TIMER_BACKUP;
+  if (strcmp(eventName, "DROGUE_INEFFECTIVE_FALLRATE") == 0) return LOG_EVENT_MAIN_DROGUE_INEFFECTIVE;
+  if (strcmp(eventName, "SERIAL_TEST_DROGUE") == 0) return LOG_EVENT_SERIAL_TEST_DROGUE;
+  if (strcmp(eventName, "SERIAL_TEST_MAIN") == 0) return LOG_EVENT_SERIAL_TEST_MAIN;
+
+  return LOG_EVENT_UNKNOWN;
+}
+
+const char* logEventNote(uint8_t code) {
+  switch (code) {
+    case LOG_EVENT_NONE:                    return "";
+    case LOG_EVENT_BOOT_READY:              return "BOOT ready";
+    case LOG_EVENT_RESET:                   return "RESET flight state to IDLE";
+    case LOG_EVENT_LAUNCH_ACCEL:            return "LAUNCH detected by accelerometer threshold";
+    case LOG_EVENT_FORCED_LAUNCH:           return "LAUNCH forced by serial command";
+    case LOG_EVENT_ASCENT_LOCKOUT_END:      return "ASCENT lockout ended by timer";
+    case LOG_EVENT_APOGEE_NEG_TREND:        return "APOGEE detected by negative vertical speed trend";
+    case LOG_EVENT_DROGUE_APOGEE:           return "DROGUE fired after apogee detection";
+    case LOG_EVENT_DROGUE_TIMER_BACKUP:     return "DROGUE fired by timer backup";
+    case LOG_EVENT_MAIN_ARMED_ALTITUDE:     return "MAIN armed after exceeding selected altitude plus margin";
+    case LOG_EVENT_MAIN_ALTITUDE_CROSS:     return "MAIN fired by altitude crossing";
+    case LOG_EVENT_MAIN_TIMER_BACKUP:       return "MAIN fired by timer backup after drogue";
+    case LOG_EVENT_MAIN_DROGUE_INEFFECTIVE: return "MAIN fired because drogue descent rate looked too fast";
+    case LOG_EVENT_SERIAL_TEST_DROGUE:      return "DROGUE fired by serial test command";
+    case LOG_EVENT_SERIAL_TEST_MAIN:        return "MAIN fired by serial test command";
+    case LOG_EVENT_UNKNOWN:                 return "EVENT occurred but name was not recognized";
+    default:                                return "";
+  }
+}
+
+// Forward declarations for persistent settings.
+bool saveCometSettings();
+bool loadCometSettings();
+
 // ============================================================================
 // RGB / Main Altitude Mode / Buzzer
 // ============================================================================
@@ -477,7 +571,7 @@ void setRGB(bool r, bool g, bool b) {
   setRGBLevel(r ? 255 : 0, g ? 255 : 0, b ? 255 : 0);
 }
 
-void setMainAltitudeMode(uint8_t mode, bool announce = true) {
+void setMainAltitudeMode(uint8_t mode, bool announce = true, bool saveToFs = false) {
   if (mode >= MAIN_ALT_MODE_COUNT) {
     mode = 0;
   }
@@ -497,12 +591,49 @@ void setMainAltitudeMode(uint8_t mode, bool announce = true) {
     Serial.print(mainAltM, 0);
     Serial.println(" m");
   }
+
+  if (saveToFs) {
+    if (saveCometSettings()) {
+      Serial.println("SETTINGS SAVED: main altitude mode");
+    } else {
+      Serial.println("SETTINGS SAVE FAILED: main altitude mode not persisted");
+    }
+  }
 }
 
 // Keep this function name because the rest of the sketch already calls it.
 // It now applies the selected main-altitude preset color.
 void updateRGBMode() {
-  setMainAltitudeMode((uint8_t)rgbMode, false);
+  setMainAltitudeMode((uint8_t)rgbMode, false, false);
+}
+
+int findMainAltitudeMode(const String& value) {
+  String v = value;
+  v.trim();
+  v.toUpperCase();
+
+  for (uint8_t i = 0; i < MAIN_ALT_MODE_COUNT; i++) {
+    if (v == MAIN_ALT_MODES[i].name) {
+      return i;
+    }
+  }
+
+  bool numeric = v.length() > 0;
+  for (uint16_t i = 0; i < v.length(); i++) {
+    if (!isDigit(v[i])) {
+      numeric = false;
+      break;
+    }
+  }
+
+  if (numeric) {
+    int mode = v.toInt();
+    if (mode >= 0 && mode < MAIN_ALT_MODE_COUNT) {
+      return mode;
+    }
+  }
+
+  return -1;
 }
 
 void beepBlocking(int times, int onMs = 100, int offMs = 100) {
@@ -573,7 +704,7 @@ void handleModeSwitch() {
       rgbMode = 0;
     }
 
-    setMainAltitudeMode((uint8_t)rgbMode, true);
+    setMainAltitudeMode((uint8_t)rgbMode, true, true);
 
     // One short confirmation beep instead of a one-second rapid pattern.
     beepBlocking(1, 40, 20);
@@ -791,6 +922,76 @@ uint32_t checksum32(const uint8_t* data, size_t len) {
   }
 
   return sum;
+}
+
+uint32_t settingsCrcCalc(CometSettings s) {
+  s.crc = 0;
+  return checksum32((const uint8_t*)&s, sizeof(CometSettings));
+}
+
+bool settingsValid(const CometSettings& s) {
+  if (s.magic != SETTINGS_MAGIC) return false;
+  if (s.version != SETTINGS_VERSION) return false;
+  if (s.mainAltMode >= MAIN_ALT_MODE_COUNT) return false;
+
+  return s.crc == settingsCrcCalc(s);
+}
+
+bool saveCometSettings() {
+  if (!loggerMounted) {
+    return false;
+  }
+
+  CometSettings s;
+  memset(&s, 0, sizeof(s));
+
+  s.magic = SETTINGS_MAGIC;
+  s.version = SETTINGS_VERSION;
+  s.mainAltMode = (uint8_t)rgbMode;
+  s.reserved = 0;
+  s.crc = settingsCrcCalc(s);
+
+  File f = LittleFS.open(COMET_SETTINGS_FILE, "w");
+  if (!f) {
+    return false;
+  }
+
+  size_t n = f.write((const uint8_t*)&s, sizeof(s));
+  f.flush();
+  f.close();
+
+  return n == sizeof(s);
+}
+
+bool loadCometSettings() {
+  if (!loggerMounted) {
+    return false;
+  }
+
+  if (!LittleFS.exists(COMET_SETTINGS_FILE)) {
+    return false;
+  }
+
+  File f = LittleFS.open(COMET_SETTINGS_FILE, "r");
+  if (!f) {
+    return false;
+  }
+
+  CometSettings s;
+  memset(&s, 0, sizeof(s));
+
+  size_t n = f.read((uint8_t*)&s, sizeof(s));
+  f.close();
+
+  if (n != sizeof(s) || !settingsValid(s)) {
+    Serial.println("SETTINGS INVALID: using default altitude mode.");
+    return false;
+  }
+
+  setMainAltitudeMode(s.mainAltMode, true, false);
+  Serial.println("SETTINGS LOADED: main altitude mode restored");
+
+  return true;
 }
 
 uint32_t headerCrcCalc(FlightLogHeader h) {
@@ -1043,7 +1244,7 @@ bool clearOldestFlightSlot() {
   loggerFull = false;
   fullButtonHoldStartMs = 0;
   fullBlinkOn = false;
-  setRGB(0, 0, 0);
+  updateRGBMode();
 
   return true;
 }
@@ -1229,6 +1430,9 @@ uint16_t makeEventFlags() {
   if (loggerFull)                             e |= (1 << 4);
   if (pyroActive())                           e |= (1 << 5);
 
+  // Upper byte carries the human-readable event code for CSV export.
+  e |= ((uint16_t)pendingLogEventCode << 8);
+
   return e;
 }
 
@@ -1310,6 +1514,9 @@ void serviceFlightLogger(uint32_t now) {
 
   activeHeader.recordCount++;
 
+  // The pending event has now been captured in this row's eventFlags upper byte.
+  pendingLogEventCode = LOG_EVENT_NONE;
+
   // Avoid periodic header rewrites during flight. LittleFS header updates
   // caused noticeable multi-second pauses at exact record-count intervals.
   // Flush the file data occasionally instead; finishActiveLog() writes the
@@ -1360,11 +1567,11 @@ void dumpSlotCsv(uint8_t slot) {
   Serial.println(slot);
 
   Serial.println(
-    "t_ms,state,flags,eventFlags,"
+    "t_ms,state,state_name,flags,eventFlags,eventCode,"
     "alt_m,vz_mps,"
     "ax_g,ay_g,az_g,"
     "gx_dps,gy_dps,gz_dps,"
-    "batt_V,temp_C,crc_ok"
+    "batt_V,temp_C,crc_ok,event_note"
   );
 
   for (uint32_t i = 0; i < h.recordCount; i++) {
@@ -1377,13 +1584,19 @@ void dumpSlotCsv(uint8_t slot) {
     r.crc = 0;
     uint16_t calc = checksum16((const uint8_t*)&r, sizeof(r));
 
+    uint8_t eventCode = (uint8_t)((r.eventFlags >> 8) & 0xFF);
+
     Serial.print(r.t_ms);
     Serial.print(',');
     Serial.print(r.state);
     Serial.print(',');
+    Serial.print(stateStr((FlightState)r.state));
+    Serial.print(',');
     Serial.print(r.flags);
     Serial.print(',');
     Serial.print(r.eventFlags);
+    Serial.print(',');
+    Serial.print(eventCode);
     Serial.print(',');
 
     Serial.print(r.alt_cm / 100.0f, 2);
@@ -1410,7 +1623,9 @@ void dumpSlotCsv(uint8_t slot) {
     Serial.print(r.temp_cC / 100.0f, 2);
     Serial.print(',');
 
-    Serial.println(oldCrc == calc ? 1 : 0);
+    Serial.print(oldCrc == calc ? 1 : 0);
+    Serial.print(',');
+    Serial.println(logEventNote(eventCode));
 
     if ((i % 64) == 0) {
       delay(1);
@@ -1548,6 +1763,12 @@ void printLogStatus() {
   Serial.print("recordCount: "); Serial.println((unsigned long)activeHeader.recordCount);
   Serial.print("nextFlightNumber: "); Serial.println((unsigned long)nextFlightNumber);
   Serial.print("MODE_SWITCH_PIN raw: "); Serial.println(digitalRead(MODE_SWITCH_PIN));
+  Serial.print("mainAltMode: "); Serial.print(rgbMode);
+  if (rgbMode >= 0 && rgbMode < MAIN_ALT_MODE_COUNT) {
+    Serial.print(" ");
+    Serial.print(MAIN_ALT_MODES[rgbMode].name);
+  }
+  Serial.print(" mainAltM: "); Serial.println(mainAltM, 1);
 
   if (loggerMounted) {
     FSInfo info;
@@ -1582,7 +1803,11 @@ bool setParam(const String& name, const String& value) {
   float fv = value.toFloat();
   uint32_t uv = (uint32_t)value.toInt();
 
-  if (name == "MAIN_ALT") {
+  if (name == "MAIN_ALT_MODE") {
+    int mode = findMainAltitudeMode(value);
+    if (mode < 0) return false;
+    setMainAltitudeMode((uint8_t)mode, true, true);
+  } else if (name == "MAIN_ALT") {
     if (fv < 1.0f || fv > 10000.0f) return false;
     mainAltM = fv;
   } else if (name == "MAIN_ARM_MARGIN") {
@@ -1612,7 +1837,7 @@ void printLoggerHelp() {
   Serial.println();
   Serial.println("Logger commands:");
   Serial.println("  LIST                 - list flight slots");
-  Serial.println("  DUMPCSV <0|1|2>      - dump slot as CSV over USB");
+  Serial.println("  DUMPCSV <0|1|2>      - dump slot as CSV with state_name and event_note columns");
   Serial.println("  DUMPBIN <0|1|2>      - dump raw binary slot over USB");
   Serial.println("  MARKDOWNLOADED <n>   - mark slot safe for reuse");
   Serial.println("  ERASE <n>            - erase one slot");
@@ -1621,6 +1846,7 @@ void printLoggerHelp() {
   Serial.println("  STARTLOG             - start a new log if a safe slot exists");
   Serial.println("  LOGSTATUS            - print logger status");
   Serial.println("  GETPARAMS            - print editable flight parameters");
+  Serial.println("  SET MAIN_ALT_MODE <0-6|COLOR> - select and save ROYGBIV main altitude mode");
   Serial.println("  SET <PARAM> <VALUE>  - update editable parameter");
   Serial.println("  LOGHELP              - show logger help");
   Serial.println();
@@ -1736,6 +1962,10 @@ bool handleLoggerCommand(String cmd) {
   return false;
 }
 
+// Forward declaration: readSensors() can report MAIN_ARMED before the
+// sendTelemetry() function body appears later in this sketch.
+void sendTelemetry(const char* eventName);
+
 // ============================================================================
 // Sensor Read + Vz
 // ============================================================================
@@ -1823,6 +2053,7 @@ bool readSensors() {
     if (!mainArmed && maxAltAGL_m > (mainAltM + mainArmMarginM)) {
       mainArmed = true;
       Serial.println("MAIN ARMED: exceeded main altitude plus margin.");
+      sendTelemetry("MAIN_ARMED_ALTITUDE");
     }
   } else {
     altAGL_m = 0.0f;
@@ -1970,6 +2201,11 @@ bool negativeTrend(uint32_t dwell_ms) {
 void sendTelemetry(const char* eventName = nullptr) {
   const uint32_t now = millis();
 
+  uint8_t code = logEventCodeFromName(eventName);
+  if (code != LOG_EVENT_NONE) {
+    pendingLogEventCode = code;
+  }
+
   float outAlt_m = (t_launch > 0) ? altAGL_m : alt_m;
 
   char pkt[420];
@@ -1996,6 +2232,8 @@ void sendTelemetry(const char* eventName = nullptr) {
     "DROGUE:%u:"
     "MAIN:%u:"
     "MAINARM:%u:"
+    "MODE:%d:"
+    "MAINALT:%.0f:"
     "PYRO:%u:"
     "LOG:%u:"
     "SLOT:%d:"
@@ -2018,6 +2256,8 @@ void sendTelemetry(const char* eventName = nullptr) {
     drogueFired ? 1 : 0,
     mainFired ? 1 : 0,
     mainArmed ? 1 : 0,
+    rgbMode,
+    safe0(mainAltM),
     pyroActive() ? 1 : 0,
     loggerActive ? 1 : 0,
     activeSlot,
@@ -2087,6 +2327,8 @@ void printHelp() {
   Serial.println("  MAIN       - test main command path");
   Serial.println("  LAUNCH     - force launch detect for bench test");
   Serial.println("  RESET      - reset flight state to IDLE");
+  Serial.println("  BEEP       - short buzzer chirp for GUI/button feedback");
+  Serial.println("  SET MAIN_ALT_MODE <0-6|COLOR> - save selected main altitude preset");
   Serial.println("  MODE BTN   - cycle main altitude preset: RED 800, ORANGE 700, YELLOW 600,");
   Serial.println("               GREEN 500, BLUE 400, INDIGO 300, VIOLET 200 meters");
   Serial.println();
@@ -2157,6 +2399,9 @@ void handleSerialInput() {
           printLoggerHelp();
         } else if (upper == "STATUS") {
           sendTelemetry("STATUS");
+        } else if (upper == "BEEP") {
+          beepBlocking(1, 40, 20);
+          Serial.println("OK BEEP");
         } else if (upper == "DROGUE") {
           deployDrogue("SERIAL_TEST_DROGUE", true);
         } else if (upper == "MAIN") {
@@ -2313,15 +2558,15 @@ void setup() {
 
     Serial.println("FAULT: Barometer failed. Deployment logic disabled.");
   } else if (mplOK && imuOK) {
-    // Default to the lowest main deployment altitude on boot.
+    // Default to the lowest main deployment altitude until saved settings load.
     // VIOLET = 200 m.
-    setMainAltitudeMode(6, true);
+    setMainAltitudeMode(6, true, false);
     beepBlocking(3, 100, 80);
     Serial.println("Sensors OK. Full launch detection enabled.");
   } else if (mplOK && !imuOK) {
     // Keep the main deployment default conservative even if IMU failed.
     // VIOLET = 200 m.
-    setMainAltitudeMode(6, true);
+    setMainAltitudeMode(6, true, false);
     beepBlocking(4, 100, 80);
     Serial.println("Warning: IMU failed. Baro-only launch detection available.");
   }
@@ -2333,6 +2578,11 @@ void setup() {
 
   if (beginFlightLogger()) {
     if (state != FlightState::FAULT) {
+      if (!loadCometSettings()) {
+        Serial.println("No saved altitude mode found. Saving current default mode.");
+        saveCometSettings();
+      }
+
       startNewLogIfSafe();
     }
   }
@@ -2523,3 +2773,4 @@ void loop() {
     digitalWrite(DROGUE_PIN, LOW);
   }
 }
+
