@@ -107,7 +107,8 @@ constexpr float BATTERY_DIVIDER_RATIO = ((R_TOP + R_BOTTOM) / R_BOTTOM);
 // Flight Parameters
 // ============================================================================
 // Runtime-editable parameters are lower-case variables so the Python GUI can
-// update them with SET <PARAM> <VALUE>. They reset to these defaults on reboot.
+// update them with SET <PARAM> <VALUE>. They default to these values on first
+// boot, then persist to LittleFS after SET commands.
 
 float     mainAltM                 = 200.0f;
 float     mainArmMarginM           = 20.0f;
@@ -337,13 +338,23 @@ const char* LOG_SLOT_FILES[LOG_SLOT_COUNT] = {
 
 const char* COMET_SETTINGS_FILE = "/comet_settings.bin";
 constexpr uint32_t SETTINGS_MAGIC   = 0x434D4554UL;  // "CMET"
-constexpr uint16_t SETTINGS_VERSION = 1;
+constexpr uint16_t SETTINGS_VERSION = 2;
 
 struct __attribute__((packed)) CometSettings {
   uint32_t magic;
   uint16_t version;
+
   uint8_t  mainAltMode;
-  uint8_t  reserved;
+  uint8_t  reserved0;
+  uint16_t reserved1;
+
+  float    mainAltM;
+  float    mainArmMarginM;
+
+  uint32_t flightLockoutMs;
+  uint32_t drogueBackupMs;
+  uint32_t mainBackupMs;
+
   uint32_t crc;
 };
 
@@ -603,11 +614,7 @@ void setMainAltitudeMode(uint8_t mode, bool announce = true, bool saveToFs = fal
   }
 
   if (saveToFs) {
-    if (saveCometSettings()) {
-      Serial.println("SETTINGS SAVED: main altitude mode");
-    } else {
-      Serial.println("SETTINGS SAVE FAILED: main altitude mode not persisted");
-    }
+    saveCometSettings();
   }
 }
 
@@ -1014,11 +1021,41 @@ bool settingsValid(const CometSettings& s) {
   if (s.version != SETTINGS_VERSION) return false;
   if (s.mainAltMode >= MAIN_ALT_MODE_COUNT) return false;
 
+  if (!finitef_safe(s.mainAltM) || s.mainAltM < 1.0f || s.mainAltM > 10000.0f) return false;
+  if (!finitef_safe(s.mainArmMarginM) || s.mainArmMarginM < 0.0f || s.mainArmMarginM > 1000.0f) return false;
+
+  if (s.drogueBackupMs < 1000UL || s.drogueBackupMs > 600000UL) return false;
+  if (s.mainBackupMs < 1000UL || s.mainBackupMs > 600000UL) return false;
+  if (s.flightLockoutMs > 120000UL) return false;
+
   return s.crc == settingsCrcCalc(s);
+}
+
+void printCometSettingsSummary(const char* prefix) {
+  Serial.print(prefix ? prefix : "SETTINGS");
+  Serial.print(": mode=");
+  Serial.print(rgbMode);
+
+  if (rgbMode >= 0 && rgbMode < MAIN_ALT_MODE_COUNT) {
+    Serial.print(" ");
+    Serial.print(MAIN_ALT_MODES[rgbMode].name);
+  }
+
+  Serial.print(" mainAltM=");
+  Serial.print(mainAltM, 2);
+  Serial.print(" mainArmMarginM=");
+  Serial.print(mainArmMarginM, 2);
+  Serial.print(" drogueBackupMs=");
+  Serial.print((unsigned long)drogueBackupMs);
+  Serial.print(" mainBackupMs=");
+  Serial.print((unsigned long)mainBackupMs);
+  Serial.print(" lockoutMs=");
+  Serial.println((unsigned long)flightLockoutMs);
 }
 
 bool saveCometSettings() {
   if (!loggerMounted) {
+    Serial.println("SETTINGS SAVE FAILED: LittleFS not mounted.");
     return false;
   }
 
@@ -1028,11 +1065,19 @@ bool saveCometSettings() {
   s.magic = SETTINGS_MAGIC;
   s.version = SETTINGS_VERSION;
   s.mainAltMode = (uint8_t)rgbMode;
-  s.reserved = 0;
+
+  s.mainAltM = mainAltM;
+  s.mainArmMarginM = mainArmMarginM;
+
+  s.flightLockoutMs = flightLockoutMs;
+  s.drogueBackupMs = drogueBackupMs;
+  s.mainBackupMs = mainBackupMs;
+
   s.crc = settingsCrcCalc(s);
 
   File f = LittleFS.open(COMET_SETTINGS_FILE, "w");
   if (!f) {
+    Serial.println("SETTINGS SAVE FAILED: could not open settings file.");
     return false;
   }
 
@@ -1040,7 +1085,14 @@ bool saveCometSettings() {
   f.flush();
   f.close();
 
-  return n == sizeof(s);
+  bool ok = (n == sizeof(s));
+  if (ok) {
+    printCometSettingsSummary("SETTINGS SAVED");
+  } else {
+    Serial.println("SETTINGS SAVE FAILED: short write.");
+  }
+
+  return ok;
 }
 
 bool loadCometSettings() {
@@ -1064,12 +1116,22 @@ bool loadCometSettings() {
   f.close();
 
   if (n != sizeof(s) || !settingsValid(s)) {
-    Serial.println("SETTINGS INVALID: using default altitude mode.");
+    Serial.println("SETTINGS INVALID/OLD: using defaults and rewriting settings file.");
     return false;
   }
 
+  // Apply selected mode first so the RGB color is restored, then restore the
+  // exact persisted parameter values. This allows MAIN_ALT to be custom while
+  // still keeping the selected ROYGBIV color/mode.
   setMainAltitudeMode(s.mainAltMode, true, false);
-  Serial.println("SETTINGS LOADED: main altitude mode restored");
+
+  mainAltM = s.mainAltM;
+  mainArmMarginM = s.mainArmMarginM;
+  flightLockoutMs = s.flightLockoutMs;
+  drogueBackupMs = s.drogueBackupMs;
+  mainBackupMs = s.mainBackupMs;
+
+  printCometSettingsSummary("SETTINGS LOADED");
 
   return true;
 }
@@ -1883,25 +1945,42 @@ bool setParam(const String& name, const String& value) {
   float fv = value.toFloat();
   uint32_t uv = (uint32_t)value.toInt();
 
+  bool changed = false;
+
   if (name == "MAIN_ALT_MODE") {
     int mode = findMainAltitudeMode(value);
     if (mode < 0) return false;
-    setMainAltitudeMode((uint8_t)mode, true, true);
+
+    // This updates rgbMode, selected color, and the preset mainAltM.
+    // Settings are saved once at the end of this function.
+    setMainAltitudeMode((uint8_t)mode, true, false);
+    changed = true;
+
   } else if (name == "MAIN_ALT") {
     if (fv < 1.0f || fv > 10000.0f) return false;
     mainAltM = fv;
+    changed = true;
+
   } else if (name == "MAIN_ARM_MARGIN") {
     if (fv < 0.0f || fv > 1000.0f) return false;
     mainArmMarginM = fv;
+    changed = true;
+
   } else if (name == "DROGUE_BACKUP_MS") {
     if (uv < 1000UL || uv > 600000UL) return false;
     drogueBackupMs = uv;
+    changed = true;
+
   } else if (name == "MAIN_BACKUP_MS") {
     if (uv < 1000UL || uv > 600000UL) return false;
     mainBackupMs = uv;
+    changed = true;
+
   } else if (name == "LOCKOUT_MS") {
     if (uv < 0UL || uv > 120000UL) return false;
     flightLockoutMs = uv;
+    changed = true;
+
   } else {
     return false;
   }
@@ -1910,6 +1989,11 @@ bool setParam(const String& name, const String& value) {
   Serial.print(name);
   Serial.print(' ');
   Serial.println(value);
+
+  if (changed) {
+    saveCometSettings();
+  }
+
   return true;
 }
 
@@ -1926,8 +2010,9 @@ void printLoggerHelp() {
   Serial.println("  STARTLOG             - start a new log if a safe slot exists");
   Serial.println("  LOGSTATUS            - print logger status");
   Serial.println("  GETPARAMS            - print editable flight parameters");
+  Serial.println("  SAVEPARAMS           - manually save current editable parameters");
   Serial.println("  SET MAIN_ALT_MODE <0-6|COLOR> - select and save ROYGBIV main altitude mode");
-  Serial.println("  SET <PARAM> <VALUE>  - update editable parameter");
+  Serial.println("  SET <PARAM> <VALUE>  - update and persist editable parameter");
   Serial.println("  LOGHELP              - show logger help");
   Serial.println();
 }
@@ -2008,6 +2093,11 @@ bool handleLoggerCommand(String cmd) {
 
   if (cmd == "GETPARAMS") {
     printParams();
+    return true;
+  }
+
+  if (cmd == "SAVEPARAMS") {
+    saveCometSettings();
     return true;
   }
 
@@ -2659,7 +2749,7 @@ void setup() {
   if (beginFlightLogger()) {
     if (state != FlightState::FAULT) {
       if (!loadCometSettings()) {
-        Serial.println("No saved altitude mode found. Saving current default mode.");
+        Serial.println("No valid saved settings found. Saving current defaults.");
         saveCometSettings();
       }
 
