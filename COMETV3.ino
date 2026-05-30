@@ -84,7 +84,15 @@ bool imuOK = false;
 // Buzzer
 // ============================================================================
 
-constexpr uint16_t BUZZER_FREQ_HZ = 4000;
+constexpr uint16_t BUZZER_FREQ_HZ = 4750;
+
+// Tuned COMET sound frequencies.
+// 4750 Hz tested loud/clear on the current buzzer without being as painful as 6000 Hz.
+constexpr uint16_t BUZZER_NICE_LOW_HZ   = 4000;
+constexpr uint16_t BUZZER_NICE_MID_HZ   = 4300;
+constexpr uint16_t BUZZER_NICE_HIGH_HZ  = 4550;
+constexpr uint16_t BUZZER_ALERT_HZ      = 4750;
+constexpr uint16_t BUZZER_FAILURE_HZ    = 6000;
 
 // ============================================================================
 // Battery Divider
@@ -262,13 +270,15 @@ int ringCount = 0;
 
 enum class BuzzerMode : uint8_t {
   IDLE,
-  RAPID
+  RAPID,
+  TONE
 };
 
 BuzzerMode buzMode = BuzzerMode::IDLE;
 bool buzState = false;
 uint32_t buzNextToggle = 0;
 uint32_t buzStopAt = 0;
+uint16_t buzFreqHz = BUZZER_FREQ_HZ;
 
 constexpr uint16_t BEEP_ON_MS  = 50;
 constexpr uint16_t BEEP_OFF_MS = 50;
@@ -636,13 +646,62 @@ int findMainAltitudeMode(const String& value) {
   return -1;
 }
 
-void beepBlocking(int times, int onMs = 100, int offMs = 100) {
-  for (int i = 0; i < times; i++) {
-    tone(BUZZER_PIN, BUZZER_FREQ_HZ);
-    delay(onMs);
-    noTone(BUZZER_PIN);
+void beepFreqBlocking(uint16_t freqHz, int onMs, int offMs = 0) {
+  tone(BUZZER_PIN, freqHz);
+  delay(onMs);
+  noTone(BUZZER_PIN);
+
+  if (offMs > 0) {
     delay(offMs);
   }
+}
+
+void beepBlocking(int times, int onMs = 100, int offMs = 100) {
+  for (int i = 0; i < times; i++) {
+    beepFreqBlocking(BUZZER_FREQ_HZ, onMs, offMs);
+  }
+}
+
+void playStartupMelody() {
+  // Selected "Smooth Rise" startup melody from the standalone test sketch.
+  beepFreqBlocking(4000, 90, 35);
+  beepFreqBlocking(4300, 90, 35);
+  beepFreqBlocking(4550, 110, 35);
+  beepFreqBlocking(4750, 180, 0);
+}
+
+void playSensorOkSound() {
+  // Two clean beeps: sensors verified.
+  beepFreqBlocking(BUZZER_ALERT_HZ, 110, 120);
+  beepFreqBlocking(BUZZER_ALERT_HZ, 110, 0);
+}
+
+void playSensorFailureSound() {
+  // Alternating failure alarm for about 5 seconds.
+  const uint32_t durationMs = 5000;
+  const uint16_t onMs = 140;
+  const uint16_t offMs = 90;
+
+  uint32_t startMs = millis();
+  bool high = false;
+
+  while (millis() - startMs < durationMs) {
+    high = !high;
+    beepFreqBlocking(high ? BUZZER_FAILURE_HZ : BUZZER_NICE_LOW_HZ, onMs, offMs);
+  }
+
+  noTone(BUZZER_PIN);
+}
+
+void startToneBeep(uint16_t freqHz, uint32_t durationMs) {
+  uint32_t now = millis();
+
+  buzMode = BuzzerMode::TONE;
+  buzState = true;
+  buzFreqHz = freqHz;
+  buzStopAt = now + durationMs;
+
+  tone(BUZZER_PIN, buzFreqHz);
 }
 
 void startRapidBeep(uint16_t seconds) {
@@ -650,11 +709,27 @@ void startRapidBeep(uint16_t seconds) {
 
   buzMode = BuzzerMode::RAPID;
   buzState = true;
+  buzFreqHz = BUZZER_ALERT_HZ;
 
-  tone(BUZZER_PIN, BUZZER_FREQ_HZ);
+  tone(BUZZER_PIN, buzFreqHz);
 
   buzNextToggle = now + BEEP_ON_MS;
   buzStopAt = now + (uint32_t)seconds * 1000UL;
+}
+
+void startLaunchDetectedSound() {
+  // Rapid constant 4750 Hz beeping for launch detect.
+  startRapidBeep(3);
+}
+
+void startDrogueFiredSound() {
+  // Long 4750 Hz pyro-confirmation tone.
+  startToneBeep(BUZZER_ALERT_HZ, 850);
+}
+
+void startMainFiredSound() {
+  // Slightly longer 4750 Hz pyro-confirmation tone.
+  startToneBeep(BUZZER_ALERT_HZ, 1200);
 }
 
 void stopBeep() {
@@ -671,11 +746,16 @@ void serviceBuzzer(uint32_t now) {
     return;
   }
 
-  if ((int32_t)(now - buzNextToggle) >= 0) {
+  if (buzMode == BuzzerMode::TONE) {
+    // Continuous tone until buzStopAt.
+    return;
+  }
+
+  if (buzMode == BuzzerMode::RAPID && (int32_t)(now - buzNextToggle) >= 0) {
     buzState = !buzState;
 
     if (buzState) {
-      tone(BUZZER_PIN, BUZZER_FREQ_HZ);
+      tone(BUZZER_PIN, buzFreqHz);
       buzNextToggle = now + BEEP_ON_MS;
     } else {
       noTone(BUZZER_PIN);
@@ -2287,7 +2367,7 @@ void deployDrogue(const char* reason, bool force = false) {
   Serial.print(">>> DROGUE DEPLOY CMD: ");
   Serial.println(reason ? reason : "-");
 
-  startRapidBeep(1);
+  startDrogueFiredSound();
   sendTelemetry(reason ? reason : "DROGUE_DEPLOY");
 
   startPyro(PyroKind::DROGUE, DROGUE_PIN);
@@ -2308,7 +2388,7 @@ void deployMain(const char* reason, bool force = false) {
   Serial.print(">>> MAIN DEPLOY CMD: ");
   Serial.println(reason ? reason : "-");
 
-  startRapidBeep(1);
+  startMainFiredSound();
   sendTelemetry(reason ? reason : "MAIN_DEPLOY");
 
   startPyro(PyroKind::MAIN, MAIN_PIN);
@@ -2372,7 +2452,7 @@ void forceLaunch() {
   t_launch = now;
   state = FlightState::ASCENT_LOCKOUT;
 
-  startRapidBeep(2);
+  startLaunchDetectedSound();
   sendTelemetry("FORCED_LAUNCH");
 }
 
@@ -2400,7 +2480,7 @@ void handleSerialInput() {
         } else if (upper == "STATUS") {
           sendTelemetry("STATUS");
         } else if (upper == "BEEP") {
-          beepBlocking(1, 40, 20);
+          beepFreqBlocking(BUZZER_ALERT_HZ, 45, 20);
           Serial.println("OK BEEP");
         } else if (upper == "DROGUE") {
           deployDrogue("SERIAL_TEST_DROGUE", true);
@@ -2477,7 +2557,7 @@ void setup() {
   Serial.println("Power stabilizing...");
   delay(POWER_STAB_MS);
 
-  beepBlocking(2, 100, 80);
+  playStartupMelody();
 
   Wire.begin();
   Wire.setClock(400000);
@@ -2554,20 +2634,20 @@ void setup() {
   if (!mplOK) {
     state = FlightState::FAULT;
     setRGB(1, 0, 0);
-    beepBlocking(5, 100, 80);
+    playSensorFailureSound();
 
     Serial.println("FAULT: Barometer failed. Deployment logic disabled.");
   } else if (mplOK && imuOK) {
     // Default to the lowest main deployment altitude until saved settings load.
     // VIOLET = 200 m.
     setMainAltitudeMode(6, true, false);
-    beepBlocking(3, 100, 80);
+    playSensorOkSound();
     Serial.println("Sensors OK. Full launch detection enabled.");
   } else if (mplOK && !imuOK) {
     // Keep the main deployment default conservative even if IMU failed.
     // VIOLET = 200 m.
     setMainAltitudeMode(6, true, false);
-    beepBlocking(4, 100, 80);
+    playSensorFailureSound();
     Serial.println("Warning: IMU failed. Baro-only launch detection available.");
   }
 
@@ -2657,7 +2737,7 @@ void loop() {
         t_launch = now;
         state = FlightState::ASCENT_LOCKOUT;
 
-        startRapidBeep(2);
+        startLaunchDetectedSound();
         sendTelemetry("LAUNCH_ACCEL");
       }
 
@@ -2773,4 +2853,3 @@ void loop() {
     digitalWrite(DROGUE_PIN, LOW);
   }
 }
-
