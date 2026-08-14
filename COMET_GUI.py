@@ -8,6 +8,7 @@ import queue
 import time
 import sys
 from datetime import datetime
+from pathlib import Path
 
 
 class LivePlot(tk.Canvas):
@@ -197,6 +198,7 @@ class COMETGUI:
         self.download_lines = []
         self.download_slot = None
         self.csv_save_path = None
+        self.csv_default_dir = str(Path.home() / "Documents")
 
         self.last_telemetry_wall_time = None
         self.telemetry_rate_hz = 0.0
@@ -206,6 +208,11 @@ class COMETGUI:
         self.connection_lost = False
         self.plot_paused = False
         self.plot_window_seconds = tk.DoubleVar(value=10.0)
+
+        # Unit system: 0 = Metric, 1 = Imperial. Firmware always remains in SI.
+        self.unit_mode = tk.IntVar(value=0)
+        self._last_unit_mode = 0
+        self.last_telemetry_data = {}
 
         self.show_data_stream = True
 
@@ -433,6 +440,39 @@ class COMETGUI:
 
         topbar.grid_columnconfigure(8, weight=1)
 
+        # Global Metric / Imperial switch. Only GUI presentation changes;
+        # firmware commands and stored logs remain in canonical SI units.
+        units = tk.Frame(topbar, bg=self.colors["panel"])
+        units.grid(row=0, column=9, sticky="e", padx=(16, 0))
+
+        tk.Label(units, text="Units", bg=self.colors["panel"], fg=self.colors["text"],
+                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 8))
+        tk.Label(units, text="Metric", bg=self.colors["panel"], fg=self.colors["muted"],
+                 font=("Segoe UI", 9)).pack(side="left")
+
+        self.unit_scale = tk.Scale(
+            units,
+            from_=0,
+            to=1,
+            resolution=1,
+            orient="horizontal",
+            showvalue=0,
+            variable=self.unit_mode,
+            command=self.on_unit_switch,
+            length=72,
+            sliderlength=24,
+            width=10,
+            bd=0,
+            highlightthickness=0,
+            troughcolor="#303030",
+            bg=self.colors["panel"],
+            activebackground=self.colors["accent_light"],
+        )
+        self.unit_scale.pack(side="left", padx=6)
+
+        tk.Label(units, text="Imperial", bg=self.colors["panel"], fg=self.colors["muted"],
+                 font=("Segoe UI", 9)).pack(side="left")
+
     def create_status_readout(self, parent):
         box = ttk.LabelFrame(parent, text="Live Status Readout", style="Card.TLabelframe")
 
@@ -630,10 +670,12 @@ class COMETGUI:
         flight_tab = ttk.Frame(self.control_notebook, style="Panel.TFrame", padding=10)
         logs_tab = ttk.Frame(self.control_notebook, style="Panel.TFrame", padding=10)
         params_tab = ttk.Frame(self.control_notebook, style="Panel.TFrame", padding=10)
+        profiles_tab = ttk.Frame(self.control_notebook, style="Panel.TFrame", padding=10)
 
         self.control_notebook.add(flight_tab, text="Flight")
         self.control_notebook.add(logs_tab, text="Logs")
         self.control_notebook.add(params_tab, text="Parameters")
+        self.control_notebook.add(profiles_tab, text="Profiles")
 
         # ------------------------------------------------------------
         # Flight tab
@@ -711,20 +753,56 @@ class COMETGUI:
 
         ttk.Label(
             params_tab,
-            text="Runtime parameters",
+            text="Active flight profile parameters",
             style="Normal.TLabel",
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
         self.param_entries = {}
+        self.param_unit_kinds = {}
+        self.param_unit_labels = {}
 
-        self.add_param_entry(params_tab, "MAIN_ALT", "200", row=1, column=0)
-        self.add_param_entry(params_tab, "MAIN_ARM_MARGIN", "20", row=1, column=1)
-        self.add_param_entry(params_tab, "DROGUE_BACKUP_MS", "15000", row=2, column=0)
-        self.add_param_entry(params_tab, "MAIN_BACKUP_MS", "25000", row=2, column=1)
-        self.add_param_entry(params_tab, "LOCKOUT_MS", "10000", row=3, column=0)
+        self.add_param_entry(params_tab, "MAIN_ALT", "200", row=1, column=0,
+                             label="Main Deploy Alt", unit_kind="distance")
+        self.add_param_entry(params_tab, "MAIN_ARM_MARGIN", "20", row=1, column=1,
+                             label="Main Arm Margin", unit_kind="distance")
+        self.add_param_entry(params_tab, "APOGEE_VZ_NEG", "-1.5", row=2, column=0,
+                             label="Apogee Vz Negative", unit_kind="speed")
+        self.add_param_entry(params_tab, "DROGUE_BACKUP_S", "15.0", row=2, column=1,
+                             label="Drogue Backup", unit_kind="seconds")
+        self.add_param_entry(params_tab, "MAIN_BACKUP_S", "25.0", row=3, column=0,
+                             label="Main Backup", unit_kind="seconds")
+        self.add_param_entry(params_tab, "LOCKOUT_S", "10.0", row=3, column=1,
+                             label="Flight Lockout", unit_kind="seconds")
+
+        methods = ttk.LabelFrame(params_tab, text="Detection Sources", style="Card.TLabelframe")
+        methods.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+
+        self.method_vars = {
+            "BARO_ENABLE": tk.BooleanVar(value=True),
+            "ACCEL_ENABLE": tk.BooleanVar(value=True),
+            "TIMER_ENABLE": tk.BooleanVar(value=True),
+        }
+
+        ttk.Checkbutton(
+            methods,
+            text="Barometer - apogee Vz + main altitude/fall-rate logic",
+            variable=self.method_vars["BARO_ENABLE"],
+        ).pack(anchor="w", pady=2)
+
+        ttk.Checkbutton(
+            methods,
+            text="Accelerometer - automatic launch detection",
+            variable=self.method_vars["ACCEL_ENABLE"],
+        ).pack(anchor="w", pady=2)
+
+        ttk.Checkbutton(
+            methods,
+            text="Timer - drogue/main backup timers",
+            variable=self.method_vars["TIMER_ENABLE"],
+        ).pack(anchor="w", pady=2)
 
         param_buttons = ttk.Frame(params_tab, style="Panel.TFrame")
-        param_buttons.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        param_buttons.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(14, 0))
         param_buttons.grid_columnconfigure(0, weight=1)
         param_buttons.grid_columnconfigure(1, weight=1)
 
@@ -732,27 +810,154 @@ class COMETGUI:
         self.make_gui_button(param_buttons, "Read Parameters", lambda: self.send_button_command("GETPARAMS")).grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
         help_box = ttk.LabelFrame(params_tab, text="Note", style="Card.TLabelframe")
-        help_box.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        help_box.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(14, 0))
         ttk.Label(
             help_box,
-            text="These values are for bench tuning and firmware-supported runtime changes. Use Read Parameters first if you are not sure what is currently loaded.",
+            text=(
+                "Times are entered in seconds and may contain decimals. The board still stores "
+                "timing internally in milliseconds. Metric/Imperial only changes the GUI; the "
+                "firmware and CSV logs stay in SI units."
+            ),
             style="Normal.TLabel",
             justify="left",
-            wraplength=330,
+            wraplength=350,
         ).pack(anchor="w")
-    def add_param_entry(self, parent, name, default, row=None, column=None):
+
+        # ------------------------------------------------------------
+        # Flight Profiles tab
+        # ------------------------------------------------------------
+        profiles_tab.grid_columnconfigure(0, weight=1)
+        profiles_tab.grid_columnconfigure(1, weight=1)
+
+        profile_select = ttk.Frame(profiles_tab, style="Panel.TFrame")
+        profile_select.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        profile_select.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(profile_select, text="Profile Color", style="Normal.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.profile_color_var = tk.StringVar(value="VIOLET")
+        self.profile_color_combo = ttk.Combobox(
+            profile_select,
+            textvariable=self.profile_color_var,
+            values=["RED", "ORANGE", "YELLOW", "GREEN", "BLUE", "INDIGO", "VIOLET"],
+            state="readonly",
+            width=14,
+        )
+        self.profile_color_combo.grid(row=0, column=1, sticky="ew")
+        self.profile_color_combo.bind("<<ComboboxSelected>>", lambda event: self.read_selected_profile())
+
+        self.profile_entries = {}
+        self.profile_unit_kinds = {}
+        self.profile_unit_labels = {}
+
+        self.add_profile_entry(profiles_tab, "MAIN_ALT", "200", row=1, column=0,
+                               label="Main Deploy Alt", unit_kind="distance")
+        self.add_profile_entry(profiles_tab, "MAIN_ARM_MARGIN", "20", row=1, column=1,
+                               label="Main Arm Margin", unit_kind="distance")
+        self.add_profile_entry(profiles_tab, "APOGEE_VZ_NEG", "-1.5", row=2, column=0,
+                               label="Apogee Vz Negative", unit_kind="speed")
+        self.add_profile_entry(profiles_tab, "DROGUE_BACKUP_S", "15.0", row=2, column=1,
+                               label="Drogue Backup", unit_kind="seconds")
+        self.add_profile_entry(profiles_tab, "MAIN_BACKUP_S", "25.0", row=3, column=0,
+                               label="Main Backup", unit_kind="seconds")
+        self.add_profile_entry(profiles_tab, "LOCKOUT_S", "10.0", row=3, column=1,
+                               label="Flight Lockout", unit_kind="seconds")
+
+        profile_methods = ttk.LabelFrame(profiles_tab, text="Profile Detection Sources", style="Card.TLabelframe")
+        profile_methods.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+
+        self.profile_method_vars = {
+            "BARO_ENABLE": tk.BooleanVar(value=True),
+            "ACCEL_ENABLE": tk.BooleanVar(value=True),
+            "TIMER_ENABLE": tk.BooleanVar(value=True),
+        }
+
+        ttk.Checkbutton(profile_methods, text="Barometer", variable=self.profile_method_vars["BARO_ENABLE"]).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(profile_methods, text="Accelerometer launch", variable=self.profile_method_vars["ACCEL_ENABLE"]).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(profile_methods, text="Timer backups", variable=self.profile_method_vars["TIMER_ENABLE"]).pack(side="left")
+
+        profile_buttons = ttk.Frame(profiles_tab, style="Panel.TFrame")
+        profile_buttons.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        for c in range(3):
+            profile_buttons.grid_columnconfigure(c, weight=1)
+
+        self.make_gui_button(profile_buttons, "Read Profile", self.read_selected_profile).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.make_gui_button(profile_buttons, "Save Profile", self.save_selected_profile, danger=True).grid(row=0, column=1, sticky="ew", padx=4)
+        self.make_gui_button(profile_buttons, "Apply Profile", self.apply_selected_profile, danger=True).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+        profile_note = ttk.LabelFrame(profiles_tab, text="Profile Behavior", style="Card.TLabelframe")
+        profile_note.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        ttk.Label(
+            profile_note,
+            text=(
+                "Each ROYGBIV color stores its own complete parameter set. Applying a profile "
+                "changes the active color and loads all of its values. The physical MODE button "
+                "cycles through these same stored profiles."
+            ),
+            style="Normal.TLabel",
+            justify="left",
+            wraplength=350,
+        ).pack(anchor="w")
+
+    def _unit_text(self, unit_kind):
+        imperial = self.unit_mode.get() == 1
+        if unit_kind == "distance":
+            return "ft" if imperial else "m"
+        if unit_kind == "speed":
+            return "ft/s" if imperial else "m/s"
+        if unit_kind == "seconds":
+            return "s"
+        return ""
+
+    def _add_value_entry(self, parent, store, unit_store, unit_label_store,
+                         name, default, row, column, label, unit_kind):
         frame = ttk.Frame(parent, style="Panel.TFrame")
+        parent.grid_columnconfigure(column, weight=1)
+        frame.grid(
+            row=row,
+            column=column,
+            sticky="ew",
+            padx=(0 if column == 0 else 6, 6 if column == 0 else 0),
+            pady=2,
+        )
 
-        if row is None or column is None:
-            frame.pack(fill="x", pady=3)
-        else:
-            parent.grid_columnconfigure(column, weight=1)
-            frame.grid(row=row, column=column, sticky="ew", padx=(0 if column == 0 else 6, 6 if column == 0 else 0), pady=2)
+        ttk.Label(frame, text=label, style="Normal.TLabel", width=19).pack(side="left")
+        unit_var = tk.StringVar(value=self._unit_text(unit_kind))
+        ttk.Label(frame, textvariable=unit_var, style="Normal.TLabel", width=5).pack(side="right", padx=(4, 0))
 
-        ttk.Label(frame, text=name, style="Normal.TLabel", width=18).pack(side="left")
         var = tk.StringVar(value=default)
         ttk.Entry(frame, textvariable=var, width=10).pack(side="right", fill="x", expand=True)
-        self.param_entries[name] = var
+
+        store[name] = var
+        unit_store[name] = unit_kind
+        unit_label_store[name] = unit_var
+
+    def add_param_entry(self, parent, name, default, row, column, label=None, unit_kind=None):
+        self._add_value_entry(
+            parent,
+            self.param_entries,
+            self.param_unit_kinds,
+            self.param_unit_labels,
+            name,
+            default,
+            row,
+            column,
+            label or name,
+            unit_kind,
+        )
+
+    def add_profile_entry(self, parent, name, default, row, column, label=None, unit_kind=None):
+        self._add_value_entry(
+            parent,
+            self.profile_entries,
+            self.profile_unit_kinds,
+            self.profile_unit_labels,
+            name,
+            default,
+            row,
+            column,
+            label or name,
+            unit_kind,
+        )
 
     def make_gui_button(self, parent, text, command, danger=False):
         normal_bg = self.colors["accent"] if danger else self.colors["panel3"]
@@ -892,6 +1097,7 @@ class COMETGUI:
             # Ask the board to identify/state itself. If the firmware responds with COMET text
             # or DATA packets, device_verified is set in handle_incoming_line().
             self.root.after(250, lambda: self.send_command("STATUS", log_to_terminal=True, board_beep=False, warn_if_disconnected=False))
+            self.root.after(450, lambda: self.send_command("GETPARAMS", log_to_terminal=True, board_beep=False, warn_if_disconnected=False))
 
         except Exception as e:
             self.ser = None
@@ -968,7 +1174,12 @@ class COMETGUI:
             if self.show_data_stream and getattr(self, "data_stream_enabled_var", None) is not None and self.data_stream_enabled_var.get():
                 self.data_log(line + "\n")
         else:
-            if "COMET" in line.upper() or "STATE" in line.upper() or "BOOT" in line.upper():
+            if line.startswith("PARAM "):
+                self.handle_parameter_response(line)
+            elif line.startswith("PROFILE "):
+                self.handle_profile_response(line)
+
+            if "COMET" in line.upper() or "STATE" in line.upper() or "BOOT" in line.upper() or line.startswith("PARAM ") or line.startswith("PROFILE "):
                 self.device_verified = True
 
         if self.device_verified and self.ser and self.ser.is_open:
@@ -999,6 +1210,8 @@ class COMETGUI:
         if not data:
             return
 
+        self.last_telemetry_data = dict(data)
+
         now_wall = time.monotonic()
         if self.last_telemetry_wall_time is not None:
             dt = now_wall - self.last_telemetry_wall_time
@@ -1007,22 +1220,7 @@ class COMETGUI:
                 self.telemetry_rate_hz = 0.85 * self.telemetry_rate_hz + 0.15 * inst_rate if self.telemetry_rate_hz > 0 else inst_rate
         self.last_telemetry_wall_time = now_wall
 
-        suffixes = {
-            "ALT": " m",
-            "VZ": " m/s",
-            "MAXALT": " m",
-            "BATT": " V",
-            "TEMP": " C",
-        }
-
-        for key in ["STATE", "ALT", "VZ", "MAXALT", "BATT", "TEMP", "SLOT", "REC"]:
-            if key in data and key in self.live_vars:
-                self.live_vars[key].set(f"{data[key]}{suffixes.get(key, '')}")
-
-        if "LOG" in data:
-            self.live_vars["LOG"].set("ACTIVE" if data["LOG"] == "1" else "OFF")
-
-        self.live_vars["RATE"].set(f"{self.telemetry_rate_hz:.1f} Hz")
+        self.update_live_status_from_data(data)
 
         try:
             t_sec = float(data.get("T_MS", "0")) / 1000.0
@@ -1030,9 +1228,74 @@ class COMETGUI:
             t_sec = time.monotonic()
 
         if not self.plot_paused:
-            self.accel_plot.add_point(t_sec, {"AX": data.get("AX", 0), "AY": data.get("AY", 0), "AZ": data.get("AZ", 0)})
-            self.gyro_plot.add_point(t_sec, {"GX": data.get("GX", 0), "GY": data.get("GY", 0), "GZ": data.get("GZ", 0)})
-            self.baro_plot.add_point(t_sec, {"ALT": data.get("ALT", 0)})
+            accel_factor = 3.280839895 if self.unit_mode.get() == 1 else 1.0
+            altitude_factor = 3.280839895 if self.unit_mode.get() == 1 else 1.0
+
+            self.accel_plot.add_point(
+                t_sec,
+                {
+                    "AX": self._float_or_zero(data.get("AX")) * accel_factor,
+                    "AY": self._float_or_zero(data.get("AY")) * accel_factor,
+                    "AZ": self._float_or_zero(data.get("AZ")) * accel_factor,
+                },
+            )
+            self.gyro_plot.add_point(
+                t_sec,
+                {
+                    "GX": self._float_or_zero(data.get("GX")),
+                    "GY": self._float_or_zero(data.get("GY")),
+                    "GZ": self._float_or_zero(data.get("GZ")),
+                },
+            )
+            self.baro_plot.add_point(
+                t_sec,
+                {"ALT": self._float_or_zero(data.get("ALT")) * altitude_factor},
+            )
+
+    def _float_or_zero(self, value):
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+
+    def update_live_status_from_data(self, data):
+        imperial = self.unit_mode.get() == 1
+        distance_factor = 3.280839895 if imperial else 1.0
+        speed_factor = 3.280839895 if imperial else 1.0
+
+        if "STATE" in data:
+            self.live_vars["STATE"].set(data["STATE"])
+
+        if "ALT" in data:
+            v = self._float_or_zero(data["ALT"]) * distance_factor
+            self.live_vars["ALT"].set(f"{v:.2f} {'ft' if imperial else 'm'}")
+
+        if "VZ" in data:
+            v = self._float_or_zero(data["VZ"]) * speed_factor
+            self.live_vars["VZ"].set(f"{v:.2f} {'ft/s' if imperial else 'm/s'}")
+
+        if "MAXALT" in data:
+            v = self._float_or_zero(data["MAXALT"]) * distance_factor
+            self.live_vars["MAXALT"].set(f"{v:.2f} {'ft' if imperial else 'm'}")
+
+        if "BATT" in data:
+            self.live_vars["BATT"].set(f"{self._float_or_zero(data['BATT']):.2f} V")
+
+        if "TEMP" in data:
+            c = self._float_or_zero(data["TEMP"])
+            if imperial:
+                self.live_vars["TEMP"].set(f"{(c * 9.0 / 5.0 + 32.0):.1f} F")
+            else:
+                self.live_vars["TEMP"].set(f"{c:.1f} C")
+
+        for key in ["SLOT", "REC"]:
+            if key in data and key in self.live_vars:
+                self.live_vars[key].set(data[key])
+
+        if "LOG" in data:
+            self.live_vars["LOG"].set("ACTIVE" if data["LOG"] == "1" else "OFF")
+
+        self.live_vars["RATE"].set(f"{self.telemetry_rate_hz:.1f} Hz")
 
     def parse_data_line(self, line):
         parts = line.strip().split(":")
@@ -1048,6 +1311,148 @@ class COMETGUI:
             i += 2
 
         return out
+
+    def _board_to_display(self, key, value):
+        v = float(value)
+        imperial = self.unit_mode.get() == 1
+
+        if key in ("MAIN_ALT", "MAIN_ARM_MARGIN"):
+            return v * 3.280839895 if imperial else v
+        if key == "APOGEE_VZ_NEG":
+            return v * 3.280839895 if imperial else v
+        if key in ("DROGUE_BACKUP_MS", "MAIN_BACKUP_MS", "LOCKOUT_MS"):
+            return v / 1000.0
+        return v
+
+    def _display_to_board(self, key, text):
+        v = float(text)
+        imperial = self.unit_mode.get() == 1
+
+        if key in ("MAIN_ALT", "MAIN_ARM_MARGIN"):
+            return v / 3.280839895 if imperial else v
+        if key == "APOGEE_VZ_NEG":
+            return v / 3.280839895 if imperial else v
+        return v
+
+    def _set_display_entry_from_board(self, entry_store, display_key, board_key, value):
+        if display_key not in entry_store:
+            return
+        try:
+            converted = self._board_to_display(board_key, value)
+        except Exception:
+            return
+
+        if display_key in ("DROGUE_BACKUP_S", "MAIN_BACKUP_S", "LOCKOUT_S"):
+            entry_store[display_key].set(f"{converted:.3f}".rstrip("0").rstrip("."))
+        else:
+            entry_store[display_key].set(f"{converted:.3f}".rstrip("0").rstrip("."))
+
+    def handle_parameter_response(self, line):
+        parts = line.split()
+        if len(parts) < 3:
+            return
+
+        name = parts[1]
+        value = parts[2]
+
+        mapping = {
+            "MAIN_ALT": ("MAIN_ALT", "MAIN_ALT"),
+            "MAIN_ARM_MARGIN": ("MAIN_ARM_MARGIN", "MAIN_ARM_MARGIN"),
+            "APOGEE_VZ_NEG": ("APOGEE_VZ_NEG", "APOGEE_VZ_NEG"),
+            "DROGUE_BACKUP_MS": ("DROGUE_BACKUP_S", "DROGUE_BACKUP_MS"),
+            "MAIN_BACKUP_MS": ("MAIN_BACKUP_S", "MAIN_BACKUP_MS"),
+            "LOCKOUT_MS": ("LOCKOUT_S", "LOCKOUT_MS"),
+        }
+
+        if name in mapping:
+            display_key, board_key = mapping[name]
+            self._set_display_entry_from_board(self.param_entries, display_key, board_key, value)
+        elif name in self.method_vars:
+            self.method_vars[name].set(value.strip() not in ("0", "OFF", "FALSE"))
+
+        if name == "MAIN_ALT_MODE" and len(parts) >= 4:
+            self.profile_color_var.set(parts[3].upper())
+
+    def handle_profile_response(self, line):
+        parts = line.split()
+        if len(parts) < 4:
+            return
+
+        color = parts[1].upper()
+        if color != self.profile_color_var.get().upper():
+            # PROFILE LIST may be streaming all colors; only populate the selected editor.
+            return
+
+        values = {}
+        i = 2
+        while i + 1 < len(parts):
+            values[parts[i]] = parts[i + 1]
+            i += 2
+
+        mapping = {
+            "MAIN_ALT": ("MAIN_ALT", "MAIN_ALT"),
+            "MAIN_ARM_MARGIN": ("MAIN_ARM_MARGIN", "MAIN_ARM_MARGIN"),
+            "APOGEE_VZ_NEG": ("APOGEE_VZ_NEG", "APOGEE_VZ_NEG"),
+            "DROGUE_BACKUP_MS": ("DROGUE_BACKUP_S", "DROGUE_BACKUP_MS"),
+            "MAIN_BACKUP_MS": ("MAIN_BACKUP_S", "MAIN_BACKUP_MS"),
+            "LOCKOUT_MS": ("LOCKOUT_S", "LOCKOUT_MS"),
+        }
+
+        for board_name, (display_key, board_key) in mapping.items():
+            if board_name in values:
+                self._set_display_entry_from_board(
+                    self.profile_entries, display_key, board_key, values[board_name]
+                )
+
+        for name, var in self.profile_method_vars.items():
+            if name in values:
+                var.set(values[name] not in ("0", "OFF", "FALSE"))
+
+    def on_unit_switch(self, _value=None):
+        new_mode = int(self.unit_mode.get())
+        old_mode = int(self._last_unit_mode)
+        if new_mode == old_mode:
+            return
+
+        factor = 3.280839895
+        if new_mode == 1 and old_mode == 0:
+            scale = factor
+        else:
+            scale = 1.0 / factor
+
+        def convert_entries(store, unit_kinds):
+            for key, var in store.items():
+                kind = unit_kinds.get(key)
+                if kind not in ("distance", "speed"):
+                    continue
+                try:
+                    var.set(f"{float(var.get()) * scale:.3f}".rstrip("0").rstrip("."))
+                except Exception:
+                    pass
+
+        if hasattr(self, "param_entries"):
+            convert_entries(self.param_entries, self.param_unit_kinds)
+            for key, unit_var in self.param_unit_labels.items():
+                unit_var.set(self._unit_text(self.param_unit_kinds.get(key)))
+
+        if hasattr(self, "profile_entries"):
+            convert_entries(self.profile_entries, self.profile_unit_kinds)
+            for key, unit_var in self.profile_unit_labels.items():
+                unit_var.set(self._unit_text(self.profile_unit_kinds.get(key)))
+
+        self._last_unit_mode = new_mode
+
+        if hasattr(self, "accel_plot"):
+            self.accel_plot.y_label = "ft/s²" if new_mode == 1 else "m/s²"
+            self.baro_plot.y_label = "ft" if new_mode == 1 else "m"
+            # Existing plot points are in the old display units; clear them instead
+            # of mixing two unit systems on one graph.
+            self.clear_plots()
+
+        if self.last_telemetry_data:
+            self.update_live_status_from_data(self.last_telemetry_data)
+
+        self.log(f"[GUI] Units changed to {'Imperial' if new_mode == 1 else 'Metric'}.\n")
 
     def send_button_command(self, cmd):
         self.send_command(cmd, log_to_terminal=True, board_beep=True)
@@ -1166,21 +1571,222 @@ class COMETGUI:
 
     def download_csv(self):
         slot = self.slot_var.get()
-        path = filedialog.asksaveasfilename(
-            title=f"Save COMET Slot {slot} CSV",
-            defaultextension=".csv",
-            initialfile=f"COMET_slot_{slot}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
-        )
-        if not path:
-            return
+        default_name = f"COMET_slot_{slot}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
-        self.csv_save_path = path
-        self.download_slot = slot
-        self.downloading = True
-        self.csv_capture_started = False
-        self.download_lines = []
-        self.send_button_command(f"DUMPCSV {slot}")
+        self.show_csv_save_dialog(slot, default_name)
+
+    def show_csv_save_dialog(self, slot, default_name):
+        """Dark, readable replacement for the native save dialog."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Save COMET Slot {slot} CSV")
+        dialog.geometry("820x280")
+        dialog.minsize(720, 250)
+        dialog.configure(bg=self.colors["bg"])
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Center over main window.
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + max(0, (self.root.winfo_width() - 820) // 2)
+        y = self.root.winfo_y() + max(0, (self.root.winfo_height() - 280) // 2)
+        dialog.geometry(f"+{x}+{y}")
+
+        outer = tk.Frame(dialog, bg=self.colors["bg"], padx=18, pady=18)
+        outer.pack(fill="both", expand=True)
+
+        title = tk.Label(
+            outer,
+            text=f"Save Slot {slot} CSV",
+            bg=self.colors["bg"],
+            fg=self.colors["accent_light"],
+            font=("Segoe UI", 18, "bold"),
+            anchor="w",
+        )
+        title.pack(fill="x", pady=(0, 14))
+
+        dir_var = tk.StringVar(value=self.csv_default_dir)
+        name_var = tk.StringVar(value=default_name)
+
+        def make_label(parent, text):
+            return tk.Label(
+                parent,
+                text=text,
+                bg=self.colors["bg"],
+                fg=self.colors["text"],
+                font=("Segoe UI", 10, "bold"),
+                anchor="w",
+            )
+
+        make_label(outer, "Folder").pack(fill="x")
+        folder_row = tk.Frame(outer, bg=self.colors["bg"])
+        folder_row.pack(fill="x", pady=(4, 12))
+
+        dir_entry = tk.Entry(
+            folder_row,
+            textvariable=dir_var,
+            bg="#101010",
+            fg="#ffffff",
+            insertbackground="#ffffff",
+            selectbackground=self.colors["accent"],
+            relief="solid",
+            bd=1,
+            font=("Consolas", 11),
+        )
+        dir_entry.pack(side="left", fill="x", expand=True, ipady=6)
+
+        def browse_folder():
+            selected = filedialog.askdirectory(
+                parent=dialog,
+                title="Choose folder for COMET CSV",
+                initialdir=dir_var.get() if Path(dir_var.get()).exists() else str(Path.home()),
+            )
+            if selected:
+                dir_var.set(selected)
+
+        browse_btn = tk.Button(
+            folder_row,
+            text="Browse...",
+            command=browse_folder,
+            bg=self.colors["panel3"],
+            fg="white",
+            activebackground="#303030",
+            activeforeground="white",
+            relief="raised",
+            bd=2,
+            padx=14,
+            pady=6,
+            font=("Segoe UI", 10, "bold"),
+        )
+        browse_btn.pack(side="left", padx=(10, 0))
+
+        make_label(outer, "File Name").pack(fill="x")
+        name_entry = tk.Entry(
+            outer,
+            textvariable=name_var,
+            bg="#101010",
+            fg="#ffffff",
+            insertbackground="#ffffff",
+            selectbackground=self.colors["accent"],
+            relief="solid",
+            bd=1,
+            font=("Consolas", 11),
+        )
+        name_entry.pack(fill="x", pady=(4, 14), ipady=6)
+        name_entry.focus_set()
+        name_entry.selection_range(0, "end")
+
+        preview_var = tk.StringVar()
+
+        def update_preview(*_):
+            filename = name_var.get().strip()
+            if filename and not filename.lower().endswith(".csv"):
+                filename += ".csv"
+            preview_var.set(str(Path(dir_var.get().strip()).expanduser() / filename) if filename else "")
+
+        dir_var.trace_add("write", update_preview)
+        name_var.trace_add("write", update_preview)
+        update_preview()
+
+        preview = tk.Label(
+            outer,
+            textvariable=preview_var,
+            bg=self.colors["bg"],
+            fg=self.colors["muted"],
+            font=("Consolas", 9),
+            anchor="w",
+            wraplength=760,
+        )
+        preview.pack(fill="x", pady=(0, 14))
+
+        button_row = tk.Frame(outer, bg=self.colors["bg"])
+        button_row.pack(fill="x")
+
+        def cancel():
+            dialog.grab_release()
+            dialog.destroy()
+
+        def save():
+            folder = Path(dir_var.get().strip()).expanduser()
+            filename = name_var.get().strip()
+
+            if not filename:
+                messagebox.showwarning("Missing File Name", "Enter a CSV file name.", parent=dialog)
+                return
+
+            if not filename.lower().endswith(".csv"):
+                filename += ".csv"
+
+            if not folder.exists():
+                ok = messagebox.askyesno(
+                    "Create Folder?",
+                    f"The folder does not exist:\n{folder}\n\nCreate it?",
+                    parent=dialog,
+                )
+                if not ok:
+                    return
+                try:
+                    folder.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    messagebox.showerror("Folder Error", f"Could not create folder:\n{e}", parent=dialog)
+                    return
+
+            path = folder / filename
+
+            if path.exists():
+                ok = messagebox.askyesno(
+                    "Overwrite CSV?",
+                    f"This file already exists:\n{path}\n\nOverwrite it?",
+                    parent=dialog,
+                )
+                if not ok:
+                    return
+
+            self.csv_default_dir = str(folder)
+            self.csv_save_path = str(path)
+            self.download_slot = slot
+            self.downloading = True
+            self.csv_capture_started = False
+            self.download_lines = []
+
+            dialog.grab_release()
+            dialog.destroy()
+
+            self.send_button_command(f"DUMPCSV {slot}")
+
+        cancel_btn = tk.Button(
+            button_row,
+            text="Cancel",
+            command=cancel,
+            bg=self.colors["panel3"],
+            fg="white",
+            activebackground="#303030",
+            activeforeground="white",
+            relief="raised",
+            bd=2,
+            padx=18,
+            pady=8,
+            font=("Segoe UI", 10, "bold"),
+        )
+        cancel_btn.pack(side="right", padx=(8, 0))
+
+        save_btn = tk.Button(
+            button_row,
+            text="Save and Download",
+            command=save,
+            bg=self.colors["accent"],
+            fg="white",
+            activebackground=self.colors["accent_dark"],
+            activeforeground="white",
+            relief="raised",
+            bd=2,
+            padx=18,
+            pady=8,
+            font=("Segoe UI", 10, "bold"),
+        )
+        save_btn.pack(side="right")
+
+        dialog.bind("<Escape>", lambda event: cancel())
+        dialog.bind("<Return>", lambda event: save())
 
     def finish_csv_download(self):
         self.downloading = False
@@ -1242,15 +1848,139 @@ class COMETGUI:
     # PARAMETER HANDLING
     # ============================================================
 
+    def _validate_detection_sources(self, methods):
+        # Accelerometer is launch detection only. At least barometer or timer must
+        # remain enabled or the board would have no automatic drogue/main path.
+        if not methods["BARO_ENABLE"].get() and not methods["TIMER_ENABLE"].get():
+            return messagebox.askyesno(
+                "No Automatic Deployment Source",
+                "Both Barometer and Timer are disabled.\n\n"
+                "That leaves no automatic drogue/main deployment method. "
+                "Continue anyway?",
+            )
+        return True
+
+    def _send_value_set(self, board_name, display_key, var):
+        text = var.get().strip()
+        if not text:
+            return
+
+        if display_key in ("DROGUE_BACKUP_S", "MAIN_BACKUP_S", "LOCKOUT_S"):
+            seconds = float(text)
+            if seconds < 0:
+                raise ValueError(f"{display_key} cannot be negative")
+            value = int(round(seconds * 1000.0))
+        else:
+            value = self._display_to_board(board_name, text)
+
+        if isinstance(value, float):
+            value_text = f"{value:.6f}".rstrip("0").rstrip(".")
+        else:
+            value_text = str(value)
+
+        self.send_command(f"SET {board_name} {value_text}", log_to_terminal=True, board_beep=False)
+        time.sleep(0.04)
+
     def send_parameters(self):
-        for name, var in self.param_entries.items():
-            value = var.get().strip()
-            if value:
-                self.send_command(f"SET {name} {value}", log_to_terminal=True, board_beep=False)
-                time.sleep(0.05)
+        if not self._validate_detection_sources(self.method_vars):
+            return
+
+        mapping = [
+            ("MAIN_ALT", "MAIN_ALT"),
+            ("MAIN_ARM_MARGIN", "MAIN_ARM_MARGIN"),
+            ("APOGEE_VZ_NEG", "APOGEE_VZ_NEG"),
+            ("DROGUE_BACKUP_MS", "DROGUE_BACKUP_S"),
+            ("MAIN_BACKUP_MS", "MAIN_BACKUP_S"),
+            ("LOCKOUT_MS", "LOCKOUT_S"),
+        ]
+
+        try:
+            for board_name, display_key in mapping:
+                self._send_value_set(board_name, display_key, self.param_entries[display_key])
+
+            for name, var in self.method_vars.items():
+                self.send_command(
+                    f"SET {name} {1 if var.get() else 0}",
+                    log_to_terminal=True,
+                    board_beep=False,
+                )
+                time.sleep(0.04)
+
+        except ValueError as e:
+            messagebox.showerror("Parameter Error", str(e))
+            return
 
         if self.BOARD_BEEP_COMMAND:
             self.send_command(self.BOARD_BEEP_COMMAND, log_to_terminal=False, board_beep=False, warn_if_disconnected=False)
+
+    def read_selected_profile(self):
+        color = self.profile_color_var.get().strip().upper()
+        if color:
+            self.send_command(f"PROFILE GET {color}", log_to_terminal=True, board_beep=False)
+
+    def _profile_board_value(self, board_name, display_key, var):
+        text = var.get().strip()
+        if not text:
+            raise ValueError(f"{display_key} is blank")
+
+        if display_key in ("DROGUE_BACKUP_S", "MAIN_BACKUP_S", "LOCKOUT_S"):
+            seconds = float(text)
+            if seconds < 0:
+                raise ValueError(f"{display_key} cannot be negative")
+            return str(int(round(seconds * 1000.0)))
+
+        value = self._display_to_board(board_name, text)
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+
+    def save_selected_profile(self):
+        if not self._validate_detection_sources(self.profile_method_vars):
+            return
+
+        color = self.profile_color_var.get().strip().upper()
+        mapping = [
+            ("MAIN_ALT", "MAIN_ALT"),
+            ("MAIN_ARM_MARGIN", "MAIN_ARM_MARGIN"),
+            ("APOGEE_VZ_NEG", "APOGEE_VZ_NEG"),
+            ("DROGUE_BACKUP_MS", "DROGUE_BACKUP_S"),
+            ("MAIN_BACKUP_MS", "MAIN_BACKUP_S"),
+            ("LOCKOUT_MS", "LOCKOUT_S"),
+        ]
+
+        try:
+            for board_name, display_key in mapping:
+                value = self._profile_board_value(
+                    board_name, display_key, self.profile_entries[display_key]
+                )
+                self.send_command(
+                    f"PROFILE SET {color} {board_name} {value}",
+                    log_to_terminal=True,
+                    board_beep=False,
+                )
+                time.sleep(0.04)
+
+            for name, var in self.profile_method_vars.items():
+                self.send_command(
+                    f"PROFILE SET {color} {name} {1 if var.get() else 0}",
+                    log_to_terminal=True,
+                    board_beep=False,
+                )
+                time.sleep(0.04)
+
+            self.root.after(250, self.read_selected_profile)
+
+        except ValueError as e:
+            messagebox.showerror("Profile Error", str(e))
+
+    def apply_selected_profile(self):
+        color = self.profile_color_var.get().strip().upper()
+        ok = messagebox.askyesno(
+            "Apply Flight Profile",
+            f"Apply the {color} flight profile to COMET?\n\n"
+            "This changes the active deployment parameters and RGB profile.",
+        )
+        if ok:
+            self.send_command(f"PROFILE APPLY {color}", log_to_terminal=True, board_beep=False)
+            self.root.after(250, lambda: self.send_command("GETPARAMS", log_to_terminal=True, board_beep=False))
 
     # ============================================================
     # TERMINAL / MISC
