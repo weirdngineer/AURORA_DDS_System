@@ -35,6 +35,20 @@
 //   Use Earle Philhower Arduino-Pico core.
 //   Choose a board/filesystem layout with enough LittleFS space.
 // ============================================================================
+// MERGED FIRING-STABILITY BUILD - 2026-08-13
+//
+// Basis:
+//   - Retains the newest COMET features from the 2945-line branch.
+//   - Restores the proven deployment-buzzer behavior from the known-good
+//     2525-line branch: 1 s rapid 4000 Hz beep before each pyro pulse.
+//   - Leaves the known-good 300 ms non-blocking pyro sequencer intact.
+//   - Defers settings-file writes until safe preflight IDLE conditions.
+//   - Blocks non-flight-critical filesystem/UI actions during flight.
+//   - Gives servicePyro() first priority in loop().
+//
+// Bench-test BOTH channels repeatedly with representative igniter loads before
+// relying on this build in flight.
+// ============================================================================
 
 // ============================================================================
 // Safety / Testing
@@ -99,7 +113,7 @@ constexpr uint16_t BUZZER_FAILURE_HZ    = 6000;
 // ============================================================================
 
 constexpr float ADC_REF_VOLTAGE = 3.3f;
-constexpr float R_TOP = 330000.0f;
+constexpr float R_TOP = 330000.0f;  // VERIFY this matches the physically populated divider resistor
 constexpr float R_BOTTOM = 100000.0f;
 constexpr float BATTERY_DIVIDER_RATIO = ((R_TOP + R_BOTTOM) / R_BOTTOM);
 
@@ -128,8 +142,8 @@ constexpr float     LAUNCH_ACCEL_DELTA_G       = 1.5f;
 constexpr uint32_t  LAUNCH_ACCEL_DWELL_MS      = 150;
 constexpr uint32_t  BASELINE_MIN_MS            = 1000;
 
-constexpr float     MAX_FALL_SPEED_FOR_DROGUE  = -100.0f; // this is bad should make this much higher closer to 100
-constexpr uint32_t  DROGUE_INEFFECTIVE_MS      = 1000; // this should also be increased to about a second 
+constexpr float     MAX_FALL_SPEED_FOR_DROGUE  = -100.0f; // RETAINED from newest branch; verify flight-safety intent separately
+constexpr uint32_t  DROGUE_INEFFECTIVE_MS      = 1000; // RETAINED from newest branch; verify flight-safety intent separately
 
 // ============================================================================
 // Pyro Timing
@@ -340,6 +354,12 @@ const char* COMET_SETTINGS_FILE = "/comet_settings.bin";
 constexpr uint32_t SETTINGS_MAGIC   = 0x434D4554UL;  // "CMET"
 constexpr uint16_t SETTINGS_VERSION = 2;
 
+// Settings writes are intentionally deferred. The known-good firing branch did
+// not perform synchronous settings-file writes from MODE/SET interactions.
+bool settingsDirty = false;
+uint32_t settingsDirtySinceMs = 0;
+constexpr uint32_t SETTINGS_SAVE_SETTLE_MS = 500;
+
 struct __attribute__((packed)) CometSettings {
   uint32_t magic;
   uint16_t version;
@@ -543,6 +563,9 @@ const char* logEventNote(uint8_t code) {
 // Forward declarations for persistent settings.
 bool saveCometSettings();
 bool loadCometSettings();
+bool settingsWriteAllowed();
+void markSettingsDirty();
+void serviceDeferredSettingsSave(uint32_t now);
 
 // ============================================================================
 // RGB / Main Altitude Mode / Buzzer
@@ -614,7 +637,9 @@ void setMainAltitudeMode(uint8_t mode, bool announce = true, bool saveToFs = fal
   }
 
   if (saveToFs) {
-    saveCometSettings();
+    // Never perform a synchronous LittleFS settings write from a UI handler.
+    // Queue it for safe preflight IDLE time instead.
+    markSettingsDirty();
   }
 }
 
@@ -711,17 +736,28 @@ void startToneBeep(uint16_t freqHz, uint32_t durationMs) {
   tone(BUZZER_PIN, buzFreqHz);
 }
 
-void startRapidBeep(uint16_t seconds) {
+void startRapidBeepHz(uint16_t seconds, uint16_t freqHz) {
   uint32_t now = millis();
 
   buzMode = BuzzerMode::RAPID;
   buzState = true;
-  buzFreqHz = BUZZER_ALERT_HZ;
+  buzFreqHz = freqHz;
 
   tone(BUZZER_PIN, buzFreqHz);
 
   buzNextToggle = now + BEEP_ON_MS;
   buzStopAt = now + (uint32_t)seconds * 1000UL;
+}
+
+void startRapidBeep(uint16_t seconds) {
+  // Newer COMET default alert sound.
+  startRapidBeepHz(seconds, BUZZER_ALERT_HZ);
+}
+
+void startPyroPreFireBeep() {
+  // IMPORTANT: preserve the proven deployment buzzer behavior from the
+  // known-good branch: 1 second rapid beep at 4000 Hz.
+  startRapidBeepHz(1, 4000);
 }
 
 void startLaunchDetectedSound() {
@@ -774,7 +810,8 @@ void serviceBuzzer(uint32_t now) {
 void handleModeSwitch() {
   // When the logger is full, the MODE button is reserved for clearing
   // the oldest saved flight slot. See serviceLoggerFullUI().
-  if (loggerFull) return;
+  // Also lock the mode UI once flight has begun and during a pyro pulse.
+  if (loggerFull || pyroActive() || t_launch > 0) return;
 
   static bool buttonWasPressed = false;
   static unsigned long lastPressTime = 0;
@@ -1134,6 +1171,36 @@ bool loadCometSettings() {
   printCometSettingsSummary("SETTINGS LOADED");
 
   return true;
+}
+
+bool settingsWriteAllowed() {
+  // Settings persistence is a preflight-only maintenance action.
+  return loggerMounted &&
+         !pyroActive() &&
+         t_launch == 0 &&
+         state == FlightState::IDLE;
+}
+
+void markSettingsDirty() {
+  settingsDirty = true;
+  settingsDirtySinceMs = millis();
+}
+
+void serviceDeferredSettingsSave(uint32_t now) {
+  if (!settingsDirty) return;
+  if (!settingsWriteAllowed()) return;
+
+  // Coalesce rapid MODE-button/GUI changes into one flash write.
+  if (now - settingsDirtySinceMs < SETTINGS_SAVE_SETTLE_MS) return;
+
+  if (saveCometSettings()) {
+    settingsDirty = false;
+    Serial.println("SETTINGS: deferred save complete.");
+  } else {
+    // Leave dirty=true so a later safe pass can retry.
+    settingsDirtySinceMs = now;
+    Serial.println("SETTINGS: deferred save failed; will retry while safe.");
+  }
 }
 
 uint32_t headerCrcCalc(FlightLogHeader h) {
@@ -1942,6 +2009,13 @@ void printParams() {
 }
 
 bool setParam(const String& name, const String& value) {
+  // Do not allow GUI/serial configuration to alter flight-critical parameters
+  // after launch or while a pyro channel is active.
+  if (t_launch > 0 || pyroActive()) {
+    Serial.println("ERR: parameter changes are locked during flight/pyro activity.");
+    return false;
+  }
+
   float fv = value.toFloat();
   uint32_t uv = (uint32_t)value.toInt();
 
@@ -1991,7 +2065,8 @@ bool setParam(const String& name, const String& value) {
   Serial.println(value);
 
   if (changed) {
-    saveCometSettings();
+    // Queue the settings write; do not block inside the command handler.
+    markSettingsDirty();
   }
 
   return true;
@@ -2011,8 +2086,8 @@ void printLoggerHelp() {
   Serial.println("  LOGSTATUS            - print logger status");
   Serial.println("  GETPARAMS            - print editable flight parameters");
   Serial.println("  SAVEPARAMS           - manually save current editable parameters");
-  Serial.println("  SET MAIN_ALT_MODE <0-6|COLOR> - select and save ROYGBIV main altitude mode");
-  Serial.println("  SET <PARAM> <VALUE>  - update and persist editable parameter");
+  Serial.println("  SET MAIN_ALT_MODE <0-6|COLOR> - select ROYGBIV mode; save is deferred safely");
+  Serial.println("  SET <PARAM> <VALUE>  - update parameter; persistence is deferred safely");
   Serial.println("  LOGHELP              - show logger help");
   Serial.println();
 }
@@ -2020,6 +2095,29 @@ void printLoggerHelp() {
 bool handleLoggerCommand(String cmd) {
   cmd.trim();
   cmd.toUpperCase();
+
+  // These commands can touch LittleFS or alter flight parameters. Keep them
+  // completely out of the active-flight path. GETPARAMS remains safe because
+  // it only reports RAM values.
+  if (t_launch > 0) {
+    bool unsafeDuringFlight =
+      cmd == "LIST" ||
+      cmd.startsWith("DUMPCSV") ||
+      cmd.startsWith("DUMPBIN") ||
+      cmd.startsWith("MARKDOWNLOADED") ||
+      cmd.startsWith("ERASE") ||
+      cmd == "FORMATLOG" ||
+      cmd == "STOPLOG" ||
+      cmd == "STARTLOG" ||
+      cmd == "LOGSTATUS" ||
+      cmd == "SAVEPARAMS" ||
+      cmd.startsWith("SET ");
+
+    if (unsafeDuringFlight) {
+      Serial.println("ERR: logger/settings management is locked during flight. RESET first.");
+      return true;
+    }
+  }
 
   if (cmd == "LIST") {
     listLogSlots();
@@ -2097,7 +2195,14 @@ bool handleLoggerCommand(String cmd) {
   }
 
   if (cmd == "SAVEPARAMS") {
-    saveCometSettings();
+    if (settingsWriteAllowed()) {
+      if (saveCometSettings()) {
+        settingsDirty = false;
+      }
+    } else {
+      markSettingsDirty();
+      Serial.println("SAVEPARAMS deferred until safe preflight IDLE conditions.");
+    }
     return true;
   }
 
@@ -2457,7 +2562,9 @@ void deployDrogue(const char* reason, bool force = false) {
   Serial.print(">>> DROGUE DEPLOY CMD: ");
   Serial.println(reason ? reason : "-");
 
-  startDrogueFiredSound();
+  // Preserve the known-good pre-fire buzzer behavior exactly in character:
+  // rapid 4000 Hz beeping, then normal telemetry, then start the pyro sequencer.
+  startPyroPreFireBeep();
   sendTelemetry(reason ? reason : "DROGUE_DEPLOY");
 
   startPyro(PyroKind::DROGUE, DROGUE_PIN);
@@ -2478,7 +2585,9 @@ void deployMain(const char* reason, bool force = false) {
   Serial.print(">>> MAIN DEPLOY CMD: ");
   Serial.println(reason ? reason : "-");
 
-  startMainFiredSound();
+  // Preserve the known-good pre-fire buzzer behavior exactly in character:
+  // rapid 4000 Hz beeping, then normal telemetry, then start the pyro sequencer.
+  startPyroPreFireBeep();
   sendTelemetry(reason ? reason : "MAIN_DEPLOY");
 
   startPyro(PyroKind::MAIN, MAIN_PIN);
@@ -2570,8 +2679,12 @@ void handleSerialInput() {
         } else if (upper == "STATUS") {
           sendTelemetry("STATUS");
         } else if (upper == "BEEP") {
-          beepFreqBlocking(BUZZER_ALERT_HZ, 45, 20);
-          Serial.println("OK BEEP");
+          if (pyroActive() || t_launch > 0) {
+            Serial.println("BEEP ignored during flight/pyro activity.");
+          } else {
+            beepFreqBlocking(BUZZER_ALERT_HZ, 45, 20);
+            Serial.println("OK BEEP");
+          }
         } else if (upper == "DROGUE") {
           deployDrogue("SERIAL_TEST_DROGUE", true);
         } else if (upper == "MAIN") {
@@ -2778,13 +2891,22 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
 
-  serviceBuzzer(now);
+  // Flight-critical output shutdown gets first CPU priority every pass.
   servicePyro(now);
-  serviceLoggerFullUI(now);
-  handleModeSwitch();
+  serviceBuzzer(now);
 
-  if (TEST_MODE) {
-    handleSerialInput();
+  // Keep newly-added UI/filesystem management activity out of the actual
+  // pyro pulse. The proven sensor/logger/state-machine path below is left
+  // unchanged from the known-good architecture.
+  if (!pyroActive()) {
+    serviceLoggerFullUI(now);
+    handleModeSwitch();
+
+    if (TEST_MODE) {
+      handleSerialInput();
+    }
+
+    serviceDeferredSettingsSave(now);
   }
 
   if (state == FlightState::FAULT) {
