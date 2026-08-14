@@ -127,6 +127,17 @@ constexpr float BATTERY_DIVIDER_RATIO = ((R_TOP + R_BOTTOM) / R_BOTTOM);
 float     mainAltM                 = 200.0f;
 float     mainArmMarginM           = 20.0f;
 
+// Runtime-adjustable apogee vertical-speed threshold. Negative means descending.
+float     apogeeNegVzThreshMps      = -1.5f;
+
+// Detection-source enables. All are ON by default.
+// BARO controls barometric apogee/main logic.
+// ACCEL controls automatic accelerometer launch detection.
+// TIMER controls drogue/main timer backups.
+bool      baroMethodsEnabled        = true;
+bool      accelMethodsEnabled       = true;
+bool      timerMethodsEnabled       = true;
+
 constexpr uint32_t  POWER_STAB_MS  = 2000;
 uint32_t  flightLockoutMs          = 10000;
 uint32_t  drogueBackupMs           = 15000;
@@ -135,7 +146,6 @@ uint32_t  mainBackupMs             = 25000;
 constexpr float     ASCENT_POS_VZ_THRESH       = 2.0f;
 constexpr uint32_t  ASCENT_POS_VZ_DWELL_MS     = 250;
 
-constexpr float     APOGEE_NEG_VZ_THRESH       = -1.5f;
 constexpr uint32_t  APOGEE_NEG_VZ_DWELL_MS     = 250;
 
 constexpr float     LAUNCH_ACCEL_DELTA_G       = 1.5f;
@@ -352,7 +362,7 @@ const char* LOG_SLOT_FILES[LOG_SLOT_COUNT] = {
 
 const char* COMET_SETTINGS_FILE = "/comet_settings.bin";
 constexpr uint32_t SETTINGS_MAGIC   = 0x434D4554UL;  // "CMET"
-constexpr uint16_t SETTINGS_VERSION = 2;
+constexpr uint16_t SETTINGS_VERSION = 3;
 
 // Settings writes are intentionally deferred. The known-good firing branch did
 // not perform synchronous settings-file writes from MODE/SET interactions.
@@ -360,20 +370,41 @@ bool settingsDirty = false;
 uint32_t settingsDirtySinceMs = 0;
 constexpr uint32_t SETTINGS_SAVE_SETTLE_MS = 500;
 
+// Each ROYGBIV color is now a complete flight profile rather than only a main
+// altitude preset. Values remain stored internally in SI units and milliseconds.
+struct __attribute__((packed)) FlightProfile {
+  float mainAltM;
+  float mainArmMarginM;
+  float apogeeNegVzThreshMps;
+
+  uint32_t flightLockoutMs;
+  uint32_t drogueBackupMs;
+  uint32_t mainBackupMs;
+
+  uint8_t baroEnabled;
+  uint8_t accelEnabled;
+  uint8_t timerEnabled;
+  uint8_t reserved;
+};
+
+FlightProfile flightProfiles[7] = {
+  {800.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 1, 0}, // RED
+  {700.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 1, 0}, // ORANGE
+  {600.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 1, 0}, // YELLOW
+  {500.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 1, 0}, // GREEN
+  {400.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 1, 0}, // BLUE
+  {300.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 1, 0}, // INDIGO
+  {200.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 1, 0}  // VIOLET
+};
+
 struct __attribute__((packed)) CometSettings {
   uint32_t magic;
   uint16_t version;
 
   uint8_t  mainAltMode;
   uint8_t  reserved0;
-  uint16_t reserved1;
 
-  float    mainAltM;
-  float    mainArmMarginM;
-
-  uint32_t flightLockoutMs;
-  uint32_t drogueBackupMs;
-  uint32_t mainBackupMs;
+  FlightProfile profiles[7];
 
   uint32_t crc;
 };
@@ -615,6 +646,40 @@ void setRGB(bool r, bool g, bool b) {
   setRGBLevel(r ? 255 : 0, g ? 255 : 0, b ? 255 : 0);
 }
 
+void applyFlightProfile(uint8_t mode) {
+  if (mode >= MAIN_ALT_MODE_COUNT) return;
+
+  const FlightProfile& p = flightProfiles[mode];
+  mainAltM = p.mainAltM;
+  mainArmMarginM = p.mainArmMarginM;
+  apogeeNegVzThreshMps = p.apogeeNegVzThreshMps;
+
+  flightLockoutMs = p.flightLockoutMs;
+  drogueBackupMs = p.drogueBackupMs;
+  mainBackupMs = p.mainBackupMs;
+
+  baroMethodsEnabled = p.baroEnabled != 0;
+  accelMethodsEnabled = p.accelEnabled != 0;
+  timerMethodsEnabled = p.timerEnabled != 0;
+}
+
+void captureRuntimeIntoActiveProfile() {
+  if (rgbMode < 0 || rgbMode >= MAIN_ALT_MODE_COUNT) return;
+
+  FlightProfile& p = flightProfiles[rgbMode];
+  p.mainAltM = mainAltM;
+  p.mainArmMarginM = mainArmMarginM;
+  p.apogeeNegVzThreshMps = apogeeNegVzThreshMps;
+
+  p.flightLockoutMs = flightLockoutMs;
+  p.drogueBackupMs = drogueBackupMs;
+  p.mainBackupMs = mainBackupMs;
+
+  p.baroEnabled = baroMethodsEnabled ? 1 : 0;
+  p.accelEnabled = accelMethodsEnabled ? 1 : 0;
+  p.timerEnabled = timerMethodsEnabled ? 1 : 0;
+}
+
 void setMainAltitudeMode(uint8_t mode, bool announce = true, bool saveToFs = false) {
   if (mode >= MAIN_ALT_MODE_COUNT) {
     mode = 0;
@@ -623,17 +688,24 @@ void setMainAltitudeMode(uint8_t mode, bool announce = true, bool saveToFs = fal
   rgbMode = mode;
 
   const MainAltitudeMode& m = MAIN_ALT_MODES[rgbMode];
-  mainAltM = m.altitude_m;
+  applyFlightProfile((uint8_t)rgbMode);
   setRGBLevel(m.r, m.g, m.b);
 
   if (announce) {
-    Serial.print("MAIN ALT MODE: ");
+    Serial.print("FLIGHT PROFILE: ");
     Serial.print(rgbMode);
     Serial.print(" ");
     Serial.print(m.name);
     Serial.print(" MAIN_ALT=");
-    Serial.print(mainAltM, 0);
-    Serial.println(" m");
+    Serial.print(mainAltM, 1);
+    Serial.print(" m VZ_NEG=");
+    Serial.print(apogeeNegVzThreshMps, 2);
+    Serial.print(" m/s BARO=");
+    Serial.print(baroMethodsEnabled ? 1 : 0);
+    Serial.print(" ACCEL=");
+    Serial.print(accelMethodsEnabled ? 1 : 0);
+    Serial.print(" TIMER=");
+    Serial.println(timerMethodsEnabled ? 1 : 0);
   }
 
   if (saveToFs) {
@@ -1053,24 +1125,34 @@ uint32_t settingsCrcCalc(CometSettings s) {
   return checksum32((const uint8_t*)&s, sizeof(CometSettings));
 }
 
+bool profileValid(const FlightProfile& p) {
+  if (!finitef_safe(p.mainAltM) || p.mainAltM < 1.0f || p.mainAltM > 10000.0f) return false;
+  if (!finitef_safe(p.mainArmMarginM) || p.mainArmMarginM < 0.0f || p.mainArmMarginM > 1000.0f) return false;
+  if (!finitef_safe(p.apogeeNegVzThreshMps) || p.apogeeNegVzThreshMps > 0.0f || p.apogeeNegVzThreshMps < -200.0f) return false;
+
+  if (p.drogueBackupMs < 1000UL || p.drogueBackupMs > 600000UL) return false;
+  if (p.mainBackupMs < 1000UL || p.mainBackupMs > 600000UL) return false;
+  if (p.flightLockoutMs > 120000UL) return false;
+
+  if (p.baroEnabled > 1 || p.accelEnabled > 1 || p.timerEnabled > 1) return false;
+  return true;
+}
+
 bool settingsValid(const CometSettings& s) {
   if (s.magic != SETTINGS_MAGIC) return false;
   if (s.version != SETTINGS_VERSION) return false;
   if (s.mainAltMode >= MAIN_ALT_MODE_COUNT) return false;
 
-  if (!finitef_safe(s.mainAltM) || s.mainAltM < 1.0f || s.mainAltM > 10000.0f) return false;
-  if (!finitef_safe(s.mainArmMarginM) || s.mainArmMarginM < 0.0f || s.mainArmMarginM > 1000.0f) return false;
-
-  if (s.drogueBackupMs < 1000UL || s.drogueBackupMs > 600000UL) return false;
-  if (s.mainBackupMs < 1000UL || s.mainBackupMs > 600000UL) return false;
-  if (s.flightLockoutMs > 120000UL) return false;
+  for (uint8_t i = 0; i < MAIN_ALT_MODE_COUNT; i++) {
+    if (!profileValid(s.profiles[i])) return false;
+  }
 
   return s.crc == settingsCrcCalc(s);
 }
 
 void printCometSettingsSummary(const char* prefix) {
   Serial.print(prefix ? prefix : "SETTINGS");
-  Serial.print(": mode=");
+  Serial.print(": profile=");
   Serial.print(rgbMode);
 
   if (rgbMode >= 0 && rgbMode < MAIN_ALT_MODE_COUNT) {
@@ -1082,12 +1164,20 @@ void printCometSettingsSummary(const char* prefix) {
   Serial.print(mainAltM, 2);
   Serial.print(" mainArmMarginM=");
   Serial.print(mainArmMarginM, 2);
+  Serial.print(" apogeeVzNeg=");
+  Serial.print(apogeeNegVzThreshMps, 2);
   Serial.print(" drogueBackupMs=");
   Serial.print((unsigned long)drogueBackupMs);
   Serial.print(" mainBackupMs=");
   Serial.print((unsigned long)mainBackupMs);
   Serial.print(" lockoutMs=");
-  Serial.println((unsigned long)flightLockoutMs);
+  Serial.print((unsigned long)flightLockoutMs);
+  Serial.print(" baro=");
+  Serial.print(baroMethodsEnabled ? 1 : 0);
+  Serial.print(" accel=");
+  Serial.print(accelMethodsEnabled ? 1 : 0);
+  Serial.print(" timer=");
+  Serial.println(timerMethodsEnabled ? 1 : 0);
 }
 
 bool saveCometSettings() {
@@ -1096,6 +1186,9 @@ bool saveCometSettings() {
     return false;
   }
 
+  // Make sure the currently active profile contains any direct runtime edits.
+  captureRuntimeIntoActiveProfile();
+
   CometSettings s;
   memset(&s, 0, sizeof(s));
 
@@ -1103,12 +1196,9 @@ bool saveCometSettings() {
   s.version = SETTINGS_VERSION;
   s.mainAltMode = (uint8_t)rgbMode;
 
-  s.mainAltM = mainAltM;
-  s.mainArmMarginM = mainArmMarginM;
-
-  s.flightLockoutMs = flightLockoutMs;
-  s.drogueBackupMs = drogueBackupMs;
-  s.mainBackupMs = mainBackupMs;
+  for (uint8_t i = 0; i < MAIN_ALT_MODE_COUNT; i++) {
+    s.profiles[i] = flightProfiles[i];
+  }
 
   s.crc = settingsCrcCalc(s);
 
@@ -1153,23 +1243,17 @@ bool loadCometSettings() {
   f.close();
 
   if (n != sizeof(s) || !settingsValid(s)) {
-    Serial.println("SETTINGS INVALID/OLD: using defaults and rewriting settings file.");
+    Serial.println("SETTINGS INVALID/OLD: using default profiles and rewriting settings file.");
     return false;
   }
 
-  // Apply selected mode first so the RGB color is restored, then restore the
-  // exact persisted parameter values. This allows MAIN_ALT to be custom while
-  // still keeping the selected ROYGBIV color/mode.
+  for (uint8_t i = 0; i < MAIN_ALT_MODE_COUNT; i++) {
+    flightProfiles[i] = s.profiles[i];
+  }
+
   setMainAltitudeMode(s.mainAltMode, true, false);
 
-  mainAltM = s.mainAltM;
-  mainArmMarginM = s.mainArmMarginM;
-  flightLockoutMs = s.flightLockoutMs;
-  drogueBackupMs = s.drogueBackupMs;
-  mainBackupMs = s.mainBackupMs;
-
   printCometSettingsSummary("SETTINGS LOADED");
-
   return true;
 }
 
@@ -1999,13 +2083,35 @@ void printParams() {
     Serial.print(' ');
     Serial.println(MAIN_ALT_MODES[rgbMode].name);
   }
-  Serial.print("PARAM MAIN_ALT "); Serial.println(mainAltM, 2);
-  Serial.print("PARAM MAIN_ARM_MARGIN "); Serial.println(mainArmMarginM, 2);
+  Serial.print("PARAM MAIN_ALT "); Serial.println(mainAltM, 3);
+  Serial.print("PARAM MAIN_ARM_MARGIN "); Serial.println(mainArmMarginM, 3);
+  Serial.print("PARAM APOGEE_VZ_NEG "); Serial.println(apogeeNegVzThreshMps, 3);
   Serial.print("PARAM DROGUE_BACKUP_MS "); Serial.println((unsigned long)drogueBackupMs);
   Serial.print("PARAM MAIN_BACKUP_MS "); Serial.println((unsigned long)mainBackupMs);
   Serial.print("PARAM LOCKOUT_MS "); Serial.println((unsigned long)flightLockoutMs);
+  Serial.print("PARAM BARO_ENABLE "); Serial.println(baroMethodsEnabled ? 1 : 0);
+  Serial.print("PARAM ACCEL_ENABLE "); Serial.println(accelMethodsEnabled ? 1 : 0);
+  Serial.print("PARAM TIMER_ENABLE "); Serial.println(timerMethodsEnabled ? 1 : 0);
   Serial.println("============================");
   Serial.println();
+}
+
+bool parseEnableValue(const String& value, bool& out) {
+  String v = value;
+  v.trim();
+  v.toUpperCase();
+
+  if (v == "1" || v == "ON" || v == "TRUE" || v == "ENABLE" || v == "ENABLED") {
+    out = true;
+    return true;
+  }
+
+  if (v == "0" || v == "OFF" || v == "FALSE" || v == "DISABLE" || v == "DISABLED") {
+    out = false;
+    return true;
+  }
+
+  return false;
 }
 
 bool setParam(const String& name, const String& value) {
@@ -2025,8 +2131,6 @@ bool setParam(const String& name, const String& value) {
     int mode = findMainAltitudeMode(value);
     if (mode < 0) return false;
 
-    // This updates rgbMode, selected color, and the preset mainAltM.
-    // Settings are saved once at the end of this function.
     setMainAltitudeMode((uint8_t)mode, true, false);
     changed = true;
 
@@ -2040,6 +2144,11 @@ bool setParam(const String& name, const String& value) {
     mainArmMarginM = fv;
     changed = true;
 
+  } else if (name == "APOGEE_VZ_NEG") {
+    if (!finitef_safe(fv) || fv > 0.0f || fv < -200.0f) return false;
+    apogeeNegVzThreshMps = fv;
+    changed = true;
+
   } else if (name == "DROGUE_BACKUP_MS") {
     if (uv < 1000UL || uv > 600000UL) return false;
     drogueBackupMs = uv;
@@ -2051,8 +2160,26 @@ bool setParam(const String& name, const String& value) {
     changed = true;
 
   } else if (name == "LOCKOUT_MS") {
-    if (uv < 0UL || uv > 120000UL) return false;
+    if (uv > 120000UL) return false;
     flightLockoutMs = uv;
+    changed = true;
+
+  } else if (name == "BARO_ENABLE") {
+    bool v;
+    if (!parseEnableValue(value, v)) return false;
+    baroMethodsEnabled = v;
+    changed = true;
+
+  } else if (name == "ACCEL_ENABLE") {
+    bool v;
+    if (!parseEnableValue(value, v)) return false;
+    accelMethodsEnabled = v;
+    changed = true;
+
+  } else if (name == "TIMER_ENABLE") {
+    bool v;
+    if (!parseEnableValue(value, v)) return false;
+    timerMethodsEnabled = v;
     changed = true;
 
   } else {
@@ -2065,10 +2192,75 @@ bool setParam(const String& name, const String& value) {
   Serial.println(value);
 
   if (changed) {
+    captureRuntimeIntoActiveProfile();
     // Queue the settings write; do not block inside the command handler.
     markSettingsDirty();
   }
 
+  return true;
+}
+
+void printProfile(uint8_t mode) {
+  if (mode >= MAIN_ALT_MODE_COUNT) return;
+
+  const FlightProfile& p = flightProfiles[mode];
+  Serial.print("PROFILE ");
+  Serial.print(MAIN_ALT_MODES[mode].name);
+  Serial.print(" MAIN_ALT "); Serial.print(p.mainAltM, 3);
+  Serial.print(" MAIN_ARM_MARGIN "); Serial.print(p.mainArmMarginM, 3);
+  Serial.print(" APOGEE_VZ_NEG "); Serial.print(p.apogeeNegVzThreshMps, 3);
+  Serial.print(" DROGUE_BACKUP_MS "); Serial.print((unsigned long)p.drogueBackupMs);
+  Serial.print(" MAIN_BACKUP_MS "); Serial.print((unsigned long)p.mainBackupMs);
+  Serial.print(" LOCKOUT_MS "); Serial.print((unsigned long)p.flightLockoutMs);
+  Serial.print(" BARO_ENABLE "); Serial.print(p.baroEnabled ? 1 : 0);
+  Serial.print(" ACCEL_ENABLE "); Serial.print(p.accelEnabled ? 1 : 0);
+  Serial.print(" TIMER_ENABLE "); Serial.println(p.timerEnabled ? 1 : 0);
+}
+
+bool setProfileParam(uint8_t mode, const String& name, const String& value) {
+  if (mode >= MAIN_ALT_MODE_COUNT) return false;
+  if (t_launch > 0 || pyroActive()) return false;
+
+  FlightProfile candidate = flightProfiles[mode];
+  float fv = value.toFloat();
+  uint32_t uv = (uint32_t)value.toInt();
+
+  if (name == "MAIN_ALT") {
+    candidate.mainAltM = fv;
+  } else if (name == "MAIN_ARM_MARGIN") {
+    candidate.mainArmMarginM = fv;
+  } else if (name == "APOGEE_VZ_NEG") {
+    candidate.apogeeNegVzThreshMps = fv;
+  } else if (name == "DROGUE_BACKUP_MS") {
+    candidate.drogueBackupMs = uv;
+  } else if (name == "MAIN_BACKUP_MS") {
+    candidate.mainBackupMs = uv;
+  } else if (name == "LOCKOUT_MS") {
+    candidate.flightLockoutMs = uv;
+  } else if (name == "BARO_ENABLE") {
+    bool v;
+    if (!parseEnableValue(value, v)) return false;
+    candidate.baroEnabled = v ? 1 : 0;
+  } else if (name == "ACCEL_ENABLE") {
+    bool v;
+    if (!parseEnableValue(value, v)) return false;
+    candidate.accelEnabled = v ? 1 : 0;
+  } else if (name == "TIMER_ENABLE") {
+    bool v;
+    if (!parseEnableValue(value, v)) return false;
+    candidate.timerEnabled = v ? 1 : 0;
+  } else {
+    return false;
+  }
+
+  if (!profileValid(candidate)) return false;
+
+  flightProfiles[mode] = candidate;
+  if (mode == (uint8_t)rgbMode) {
+    applyFlightProfile(mode);
+  }
+
+  markSettingsDirty();
   return true;
 }
 
@@ -2087,7 +2279,11 @@ void printLoggerHelp() {
   Serial.println("  GETPARAMS            - print editable flight parameters");
   Serial.println("  SAVEPARAMS           - manually save current editable parameters");
   Serial.println("  SET MAIN_ALT_MODE <0-6|COLOR> - select ROYGBIV mode; save is deferred safely");
-  Serial.println("  SET <PARAM> <VALUE>  - update parameter; persistence is deferred safely");
+  Serial.println("  SET <PARAM> <VALUE>  - update active profile parameter; persistence is deferred");
+  Serial.println("  PROFILE LIST          - print all seven ROYGBIV flight profiles");
+  Serial.println("  PROFILE GET <COLOR>   - print one flight profile");
+  Serial.println("  PROFILE APPLY <COLOR> - make that profile active");
+  Serial.println("  PROFILE SET <COLOR> <PARAM> <VALUE> - edit a stored profile");
   Serial.println("  LOGHELP              - show logger help");
   Serial.println();
 }
@@ -2111,7 +2307,8 @@ bool handleLoggerCommand(String cmd) {
       cmd == "STARTLOG" ||
       cmd == "LOGSTATUS" ||
       cmd == "SAVEPARAMS" ||
-      cmd.startsWith("SET ");
+      cmd.startsWith("SET ") ||
+      cmd.startsWith("PROFILE ");
 
     if (unsafeDuringFlight) {
       Serial.println("ERR: logger/settings management is locked during flight. RESET first.");
@@ -2202,6 +2399,71 @@ bool handleLoggerCommand(String cmd) {
     } else {
       markSettingsDirty();
       Serial.println("SAVEPARAMS deferred until safe preflight IDLE conditions.");
+    }
+    return true;
+  }
+
+  if (cmd == "PROFILE LIST") {
+    for (uint8_t i = 0; i < MAIN_ALT_MODE_COUNT; i++) {
+      printProfile(i);
+    }
+    return true;
+  }
+
+  if (cmd.startsWith("PROFILE GET ")) {
+    String modeText = cmd.substring(12);
+    modeText.trim();
+    int mode = findMainAltitudeMode(modeText);
+    if (mode < 0) {
+      Serial.println("ERR: invalid profile color/index.");
+    } else {
+      printProfile((uint8_t)mode);
+    }
+    return true;
+  }
+
+  if (cmd.startsWith("PROFILE APPLY ")) {
+    String modeText = cmd.substring(14);
+    modeText.trim();
+    int mode = findMainAltitudeMode(modeText);
+    if (mode < 0) {
+      Serial.println("ERR: invalid profile color/index.");
+    } else {
+      setMainAltitudeMode((uint8_t)mode, true, true);
+      printParams();
+    }
+    return true;
+  }
+
+  if (cmd.startsWith("PROFILE SET ")) {
+    String rest = cmd.substring(12);
+    rest.trim();
+
+    int s1 = rest.indexOf(' ');
+    int s2 = (s1 >= 0) ? rest.indexOf(' ', s1 + 1) : -1;
+
+    if (s1 < 0 || s2 < 0) {
+      Serial.println("ERR: use PROFILE SET <COLOR> <PARAM> <VALUE>");
+      return true;
+    }
+
+    String modeText = rest.substring(0, s1);
+    String name = rest.substring(s1 + 1, s2);
+    String value = rest.substring(s2 + 1);
+    modeText.trim();
+    name.trim();
+    value.trim();
+
+    int mode = findMainAltitudeMode(modeText);
+    if (mode < 0 || !setProfileParam((uint8_t)mode, name, value)) {
+      Serial.println("ERR: invalid PROFILE SET command/value.");
+    } else {
+      Serial.print("OK PROFILE SET ");
+      Serial.print(MAIN_ALT_MODES[mode].name);
+      Serial.print(' ');
+      Serial.print(name);
+      Serial.print(' ');
+      Serial.println(value);
     }
     return true;
   }
@@ -2460,7 +2722,7 @@ bool positiveTrend(uint32_t dwell_ms) {
 bool negativeTrend(uint32_t dwell_ms) {
   static uint32_t negStart = 0;
 
-  if (vz_mps < APOGEE_NEG_VZ_THRESH) {
+  if (vz_mps < apogeeNegVzThreshMps) {
     if (negStart == 0) negStart = millis();
     return (millis() - negStart) >= dwell_ms;
   }
@@ -2483,7 +2745,7 @@ void sendTelemetry(const char* eventName = nullptr) {
 
   float outAlt_m = (t_launch > 0) ? altAGL_m : alt_m;
 
-  char pkt[420];
+  char pkt[520];
 
   // Keep this line parser-friendly for the COMET Python GUI:
   // DATA:<t>:KEY:VALUE:KEY:VALUE...
@@ -2509,6 +2771,10 @@ void sendTelemetry(const char* eventName = nullptr) {
     "MAINARM:%u:"
     "MODE:%d:"
     "MAINALT:%.0f:"
+    "VZNEG:%.2f:"
+    "BAROEN:%u:"
+    "ACCELEN:%u:"
+    "TIMEREN:%u:"
     "PYRO:%u:"
     "LOG:%u:"
     "SLOT:%d:"
@@ -2533,6 +2799,10 @@ void sendTelemetry(const char* eventName = nullptr) {
     mainArmed ? 1 : 0,
     rgbMode,
     safe0(mainAltM),
+    safe0(apogeeNegVzThreshMps),
+    baroMethodsEnabled ? 1 : 0,
+    accelMethodsEnabled ? 1 : 0,
+    timerMethodsEnabled ? 1 : 0,
     pyroActive() ? 1 : 0,
     loggerActive ? 1 : 0,
     activeSlot,
@@ -2841,8 +3111,8 @@ void setup() {
 
     Serial.println("FAULT: Barometer failed. Deployment logic disabled.");
   } else if (mplOK && imuOK) {
-    // Default to the lowest main deployment altitude until saved settings load.
-    // VIOLET = 200 m.
+    // Default to the VIOLET flight profile until saved settings load.
+    // VIOLET defaults to 200 m main deployment.
     setMainAltitudeMode(6, true, false);
     playSensorOkSound();
     Serial.println("Sensors OK. Full launch detection enabled.");
@@ -2928,7 +3198,7 @@ void loop() {
 
   switch (state) {
     case FlightState::IDLE: {
-      bool launchAccel = launchDetectAccel(now);
+      bool launchAccel = accelMethodsEnabled && launchDetectAccel(now);
 
       // Do NOT auto-launch from barometric vertical speed.
       // The MPL3115A2 can occasionally produce a small altitude step while sitting
@@ -2966,12 +3236,13 @@ void loop() {
     }
 
     case FlightState::ASCENT: {
-      if (negativeTrend(APOGEE_NEG_VZ_DWELL_MS)) {
+      if (baroMethodsEnabled && negativeTrend(APOGEE_NEG_VZ_DWELL_MS)) {
         state = FlightState::APOGEE_DETECT;
         sendTelemetry("APOGEE_NEG_TREND");
       }
 
       if (!drogueFired &&
+          timerMethodsEnabled &&
           drogueTimerElapsed &&
           (now - t_launch >= flightLockoutMs)) {
         deployDrogue("TIMER_BACKUP_DROGUE", true);
@@ -2983,6 +3254,7 @@ void loop() {
 
     case FlightState::APOGEE_DETECT: {
       if (!drogueFired &&
+          baroMethodsEnabled &&
           vz_mps <= 0.0f &&
           (now - t_launch >= flightLockoutMs)) {
         deployDrogue("APOGEE", false);
@@ -2990,6 +3262,7 @@ void loop() {
       }
 
       if (!drogueFired &&
+          timerMethodsEnabled &&
           drogueTimerElapsed &&
           (now - t_launch >= flightLockoutMs)) {
         deployDrogue("TIMER_BACKUP_DROGUE", true);
@@ -3002,7 +3275,7 @@ void loop() {
     case FlightState::DROGUE_DEPLOYED: {
       static uint32_t downFastStart = 0;
 
-      if (vz_mps <= MAX_FALL_SPEED_FOR_DROGUE) {
+      if (baroMethodsEnabled && vz_mps <= MAX_FALL_SPEED_FOR_DROGUE) {
         if (downFastStart == 0) downFastStart = now;
 
         if (!mainFired &&
@@ -3017,6 +3290,7 @@ void loop() {
       }
 
       if (!mainFired &&
+          baroMethodsEnabled &&
           mainArmed &&
           altAGL_m <= mainAltM &&
           vz_mps <= 0.0f &&
@@ -3027,6 +3301,7 @@ void loop() {
       }
 
       if (!mainFired &&
+          timerMethodsEnabled &&
           drogueFired &&
           mainTimerElapsed &&
           (now - t_launch >= flightLockoutMs)) {
