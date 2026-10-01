@@ -721,7 +721,7 @@ class COMETGUI:
 
         ttk.Label(slotrow, text="Selected Slot", style="Normal.TLabel").grid(row=0, column=0, sticky="w")
         self.slot_var = tk.StringVar(value="0")
-        self.slot_combo = ttk.Combobox(slotrow, textvariable=self.slot_var, values=["0", "1", "2"], width=8, state="readonly")
+        self.slot_combo = ttk.Combobox(slotrow, textvariable=self.slot_var, values=["0", "1", "2", "3", "4"], width=8, state="readonly")
         self.slot_combo.grid(row=0, column=1, sticky="e")
 
         self.make_gui_button(logs_tab, "List Logs", lambda: self.send_button_command("LIST")).grid(row=1, column=0, sticky="ew", pady=4)
@@ -744,6 +744,23 @@ class COMETGUI:
 
         self.make_gui_button(advanced_logs, "STARTLOG", lambda: self.send_button_command("STARTLOG")).grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=4)
         self.make_gui_button(advanced_logs, "STOPLOG", lambda: self.send_button_command("STOPLOG")).grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=4)
+
+        button_help = ttk.LabelFrame(logs_tab, text="Physical MODE Button / Log Clearing", style="Card.TLabelframe")
+        button_help.grid(row=7, column=0, sticky="ew", pady=(12, 0))
+        ttk.Label(
+            button_help,
+            text=(
+                "Tap: change flight profile.\n"
+                "Hold 5 seconds: erase oldest completed log (4000 Hz short beep).\n"
+                "Keep holding to 10 seconds: erase ALL 5 logs (4550 Hz longer beep).\n"
+                "Only available before launch. Erased data cannot be recovered.\n"
+                "After clearing, use List Logs to verify the slots."
+            ),
+            style="Normal.TLabel",
+            justify="left",
+            wraplength=350,
+        ).pack(anchor="w")
+
 
         # ------------------------------------------------------------
         # Parameters tab
