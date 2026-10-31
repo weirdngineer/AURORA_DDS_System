@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "SimpleRecoveryLogic.h"
 #include "OptionalBackupTimers.h"
+#include "AltitudeFilter.h"
 #include <Wire.h>
 #include <LittleFS.h>
 
@@ -141,7 +142,8 @@ bool      accelMethodsEnabled       = true;
 bool      timerMethodsEnabled       = false;
 
 constexpr uint32_t  POWER_STAB_MS  = 2000;
-uint32_t  flightLockoutMs          = 10000;
+uint32_t  flightLockoutMs          = 10000; // configurable; inhibits AUTO deployment requests after launch
+uint32_t  drogueMainGapMs           = 3000;  // configurable; also protects manual main after drogue
 uint32_t  drogueBackupMs           = 15000;
 uint32_t  mainBackupMs             = 25000;
 
@@ -177,7 +179,11 @@ constexpr uint32_t TELEMETRY_PERIOD_MS = 100;  // 10 Hz
 // the IMU, barometer, battery, logger, and telemetry on separate schedules.
 
 constexpr uint32_t IMU_READ_PERIOD_MS     = 10;    // 100 Hz target
-constexpr uint32_t BARO_READ_PERIOD_MS    = 100;   // 10 Hz target if this can be increased that would be cool
+// One-shot at 16x oversampling: ~66 ms conversion, 100 ms requested cadence.
+// Check PDR (fresh measurement) before consuming any sample.
+constexpr uint32_t BARO_READ_PERIOD_MS    = 10;    // poll status at up to 100 Hz
+constexpr uint32_t BARO_CONVERSION_PERIOD_MS = 100;
+constexpr uint32_t BARO_CONVERSION_TIMEOUT_MS = 450;
 constexpr uint32_t BATTERY_READ_PERIOD_MS = 1000;  // 1 Hz target
 
 uint32_t lastImuReadMs = 0;
@@ -276,6 +282,13 @@ float gz_dps = 0.0f;
 float imuTemp_C = 0.0f;
 float mplTemp_C = 0.0f;
 float pressure_Pa = 0.0f;
+float rawAltRel_m = 0.0f;  // diagnostic unfiltered altitude relative to pad
+comet_alt::Filter altitudeFilter;
+bool baroShotActive = false;
+uint32_t baroShotStartedMs = 0;
+uint32_t baroLastShotStartedMs = 0;
+uint32_t baroFreshSamples = 0;
+uint32_t baroTimeouts = 0;
 float batt_V = 0.0f;
 
 float accelMag_g = 0.0f;
@@ -324,6 +337,13 @@ uint16_t buzFreqHz = BUZZER_FREQ_HZ;
 
 constexpr uint16_t BEEP_ON_MS  = 50;
 constexpr uint16_t BEEP_OFF_MS = 50;
+
+// Original COMET_Heartbeat.ino: quiet IDLE chirp every two seconds.
+constexpr uint32_t HEARTBEAT_PERIOD_MS = 2000;
+constexpr uint32_t HEARTBEAT_DURATION_MS = 70;
+constexpr uint16_t HEARTBEAT_FREQ_HZ = BUZZER_NICE_MID_HZ;
+uint32_t lastHeartbeatMs = 0;
+bool heartbeatWasIdle = false;
 
 // ============================================================================
 // Non-blocking Pyro
@@ -392,7 +412,7 @@ const char* const STATIC_SLOT_FILES[STATIC_SLOT_COUNT] = {
 
 const char* COMET_SETTINGS_FILE = "/comet_settings.bin";
 constexpr uint32_t SETTINGS_MAGIC   = 0x434D4554UL;  // "CMET"
-constexpr uint16_t SETTINGS_VERSION = 4;
+constexpr uint16_t SETTINGS_VERSION = 5;
 
 // Settings writes are intentionally deferred. The known-good firing branch did
 // not perform synchronous settings-file writes from MODE/SET interactions.
@@ -418,17 +438,17 @@ struct __attribute__((packed)) FlightProfile {
   uint8_t baroEnabled;
   uint8_t accelEnabled;
   uint8_t timerEnabled;
-  uint8_t reserved;
+  uint8_t minDrogueMainGapS; // v5: 1..60 s, old versions used reserved=0
 };
 
 FlightProfile flightProfiles[7] = {
-  {800.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 0}, // RED
-  {700.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 0}, // ORANGE
-  {600.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 0}, // YELLOW
-  {500.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 0}, // GREEN
-  {400.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 0}, // BLUE
-  {300.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 0}, // INDIGO
-  {200.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 0}  // VIOLET
+  {800.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 3}, // RED
+  {700.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 3}, // ORANGE
+  {600.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 3}, // YELLOW
+  {500.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 3}, // GREEN
+  {400.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 3}, // BLUE
+  {300.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 3}, // INDIGO
+  {200.0f, 20.0f, -1.5f, 10000, 15000, 25000, 1, 1, 0, 3}  // VIOLET
 };
 
 struct __attribute__((packed)) CometSettings {
@@ -712,6 +732,7 @@ void applyFlightProfile(uint8_t mode) {
   apogeeNegVzThreshMps = p.apogeeNegVzThreshMps;
 
   flightLockoutMs = p.flightLockoutMs;
+  drogueMainGapMs = (uint32_t)(p.minDrogueMainGapS ? p.minDrogueMainGapS : 3) * 1000UL;
   drogueBackupMs = p.drogueBackupMs;
   mainBackupMs = p.mainBackupMs;
 
@@ -729,6 +750,7 @@ void captureRuntimeIntoActiveProfile() {
   p.apogeeNegVzThreshMps = apogeeNegVzThreshMps;
 
   p.flightLockoutMs = flightLockoutMs;
+  p.minDrogueMainGapS = (uint8_t)(drogueMainGapMs / 1000UL);
   p.drogueBackupMs = drogueBackupMs;
   p.mainBackupMs = mainBackupMs;
 
@@ -936,6 +958,23 @@ void serviceBuzzer(uint32_t now) {
   }
 }
 
+// Lowest-priority audible heartbeat. Not an ARMED or continuity indication.
+void serviceHeartbeat(uint32_t now) {
+  const bool waitingForLaunch = (state == FlightState::IDLE &&
+                                 t_launch == 0 && !loggerFull &&
+                                 !downloadMode && !pyroActive());
+  if (!waitingForLaunch) { heartbeatWasIdle = false; return; }
+  if (!heartbeatWasIdle) {
+    heartbeatWasIdle = true;
+    lastHeartbeatMs = now;
+    return;
+  }
+  if (buzMode != BuzzerMode::IDLE ||
+      (uint32_t)(now - lastHeartbeatMs) < HEARTBEAT_PERIOD_MS) return;
+  lastHeartbeatMs = now;
+  startToneBeep(HEARTBEAT_FREQ_HZ, HEARTBEAT_DURATION_MS);
+}
+
 void handleModeSwitch() {
   // When the logger is full, the MODE button is reserved for clearing
   // the oldest saved flight slot. See serviceLoggerFullUI().
@@ -1014,6 +1053,11 @@ constexpr uint8_t MPL_STATUS      = 0x00;
 constexpr uint8_t MPL_OUT_P_MSB   = 0x01;
 constexpr uint8_t MPL_PT_DATA_CFG = 0x13;
 constexpr uint8_t MPL_CTRL_REG1   = 0x26;
+constexpr uint8_t MPL_DR_STATUS = 0x06;
+constexpr uint8_t MPL_DATA_READY_P = 0x04;
+// 0x80 altimeter mode; OS16=0x20; standby=0; OST=0x02.
+constexpr uint8_t MPL_OS16_STANDBY = 0xA0;
+constexpr uint8_t MPL_OS16_SHOT = 0xA2;
 
 bool writeRegister8(uint8_t addr, uint8_t reg, uint8_t value) {
   Wire.beginTransmission(addr);
@@ -1043,45 +1087,61 @@ bool readBurst(uint8_t addr, uint8_t startReg, uint8_t* buf, uint8_t len) {
   return true;
 }
 
+// One-shot mode replaces 1x continuous mode. The previous 0x81 mode can
+// leave 10 Hz reads repeatedly returning the same last conversion.
 bool configureMPLFastAltimeter() {
-  // Put the part in standby before changing CTRL_REG1/PT_DATA_CFG.
   uint8_t ctrl = readRegister(MPL_ADDR, MPL_CTRL_REG1);
   if (ctrl == 0xFF) return false;
-
-  if (!writeRegister8(MPL_ADDR, MPL_CTRL_REG1, ctrl & ~0x01)) return false;
+  if (!writeRegister8(MPL_ADDR, MPL_CTRL_REG1, ctrl & (uint8_t)~0x01)) return false;
   delay(10);
-
-  // Enable data event flags for pressure/altitude and temperature.
   if (!writeRegister8(MPL_ADDR, MPL_PT_DATA_CFG, 0x07)) return false;
-
-  // ALT=1 altimeter mode, OS=0 fastest oversampling, SBYB=1 active.
-  // 0x81 = 1000 0001b.
-  if (!writeRegister8(MPL_ADDR, MPL_CTRL_REG1, 0x81)) return false;
-  delay(20);
-
+  if (!writeRegister8(MPL_ADDR, MPL_CTRL_REG1, MPL_OS16_STANDBY)) return false;
+  baroShotActive = false;
+  baroShotStartedMs = baroLastShotStartedMs = 0;
   return true;
 }
 
+// Decode ONLY when the status reports a new pressure/altitude measurement.
 bool readMPLFast(float& altitude_m, float& temp_C) {
   uint8_t b[5];
-
-  // OUT_P_MSB/CSB/LSB contain altitude in altimeter mode.
-  // OUT_T_MSB/LSB contain temperature.
-  if (!readBurst(MPL_ADDR, MPL_OUT_P_MSB, b, sizeof(b))) {
-    return false;
-  }
-
-  // Altitude is a signed 20-bit fixed-point value with 4 fractional bits.
-  // Build it as a sign-extended int32 and divide by 16.
-  int32_t rawAlt = ((int32_t)b[0] << 24) | ((int32_t)b[1] << 16) | ((int32_t)(b[2] & 0xF0) << 8);
+  if (!readBurst(MPL_ADDR, MPL_OUT_P_MSB, b, sizeof(b))) return false;
+  int32_t rawAlt = ((int32_t)b[0] << 24) | ((int32_t)b[1] << 16) |
+                   ((int32_t)(b[2] & 0xF0) << 8);
   rawAlt >>= 12;
   altitude_m = rawAlt / 16.0f;
-
-  // Temperature is signed 12-bit fixed-point with 4 fractional bits.
   int16_t rawTemp = ((int16_t)b[3] << 8) | b[4];
   rawTemp >>= 4;
   temp_C = rawTemp / 16.0f;
+  return finitef_safe(altitude_m) && finitef_safe(temp_C) &&
+         altitude_m >= -1000.0f && altitude_m <= 12000.0f;
+}
 
+// Nonblocking sample collector. Check OST has auto-cleared, then check PDR
+// to avoid counting an old register value as a new measurement.
+bool pollMPLFresh(uint32_t now, float& altitude_m, float& temp_C) {
+  if (!baroShotActive) {
+    if (baroLastShotStartedMs != 0 &&
+        (uint32_t)(now - baroLastShotStartedMs) < BARO_CONVERSION_PERIOD_MS)
+      return false;
+    if (!writeRegister8(MPL_ADDR, MPL_CTRL_REG1, MPL_OS16_SHOT)) return false;
+    baroLastShotStartedMs = now;
+    baroShotStartedMs = now;
+    baroShotActive = true;
+    return false;
+  }
+  if ((uint32_t)(now - baroShotStartedMs) > BARO_CONVERSION_TIMEOUT_MS) {
+    baroShotActive = false;
+    baroTimeouts++;
+    // Sensor may be stalled; DO NOT count unchanged altitude as a fresh sample.
+    return false;
+  }
+  uint8_t ctrl = readRegister(MPL_ADDR, MPL_CTRL_REG1);
+  if (ctrl == 0xFF || (ctrl & 0x02)) return false;
+  uint8_t status = readRegister(MPL_ADDR, MPL_DR_STATUS);
+  if (status == 0xFF || !(status & MPL_DATA_READY_P)) return false;
+  if (!readMPLFast(altitude_m, temp_C)) return false;
+  baroShotActive = false;
+  baroFreshSamples++;
   return true;
 }
 
@@ -1190,6 +1250,7 @@ bool profileValid(const FlightProfile& p) {
   if (p.drogueBackupMs < 1000UL || p.drogueBackupMs > 600000UL) return false;
   if (p.mainBackupMs < 1000UL || p.mainBackupMs > 600000UL) return false;
   if (p.flightLockoutMs > 120000UL) return false;
+  if (p.minDrogueMainGapS > 60) return false;
 
   if (p.baroEnabled > 1 || p.accelEnabled > 1 || p.timerEnabled > 1) return false;
   return true;
@@ -1197,13 +1258,14 @@ bool profileValid(const FlightProfile& p) {
 
 bool settingsValid(const CometSettings& s) {
   if (s.magic != SETTINGS_MAGIC) return false;
-  // v3 had inert timer fields. Accept it for migration but never reactivate
-  // old timerEnabled flags; v4 represents an explicit new opt-in.
-  if (s.version != SETTINGS_VERSION && s.version != 3) return false;
+  // Packed profile layout unchanged: accept v3/v4 and migrate its reserved
+  // byte into v5 safety-gap field. v3 timer enables remain OFF.
+  if (s.version != SETTINGS_VERSION && s.version != 4 && s.version != 3) return false;
   if (s.mainAltMode >= MAIN_ALT_MODE_COUNT) return false;
 
   for (uint8_t i = 0; i < MAIN_ALT_MODE_COUNT; i++) {
     if (!profileValid(s.profiles[i])) return false;
+    if (s.version == SETTINGS_VERSION && s.profiles[i].minDrogueMainGapS == 0) return false;
   }
 
   return s.crc == settingsCrcCalc(s);
@@ -1229,8 +1291,10 @@ void printCometSettingsSummary(const char* prefix) {
   Serial.print((unsigned long)drogueBackupMs);
   Serial.print(" mainBackupMs=");
   Serial.print((unsigned long)mainBackupMs);
-  Serial.print(" legacyLockoutMs=");
+  Serial.print(" lockoutMs=");
   Serial.print((unsigned long)flightLockoutMs);
+  Serial.print(" drogueMainGapMs=");
+  Serial.print((unsigned long)drogueMainGapMs);
   Serial.print(" baro=");
   Serial.print(baroMethodsEnabled ? 1 : 0);
   Serial.print(" accel=");
@@ -1306,16 +1370,17 @@ bool loadCometSettings() {
     return false;
   }
 
-  const bool migratedFromV3 = s.version == 3;
+  const bool migrated = s.version != SETTINGS_VERSION;
   for (uint8_t i = 0; i < MAIN_ALT_MODE_COUNT; i++) {
     flightProfiles[i] = s.profiles[i];
-    if (migratedFromV3) flightProfiles[i].timerEnabled = 0;
+    if (s.version == 3) flightProfiles[i].timerEnabled = 0;
+    if (migrated) flightProfiles[i].minDrogueMainGapS = 3;
   }
 
   setMainAltitudeMode(s.mainAltMode, true, false);
-  if (migratedFromV3) {
-    Serial.println("SETTINGS: v3 profile migration; ALL timer backups forced OFF.");
-    markSettingsDirty(); // Save v4 in safe IDLE, not during initial setup.
+  if (migrated) {
+    Serial.println("SETTINGS: migrated old profiles; default 3 s drogue-main gap. v3 timers OFF.");
+    markSettingsDirty(); // Save v5 once safely IDLE.
   }
 
   printCometSettingsSummary("SETTINGS LOADED");
@@ -1984,6 +2049,13 @@ void printParams() {
   Serial.print("PARAM ACCEL_ENABLE "); Serial.println(accelMethodsEnabled ? 1 : 0);
   Serial.println("PARAM BARO_ENABLE 1 (hard-required)");
   Serial.print("PARAM TIMER_ENABLE "); Serial.println(timerMethodsEnabled ? 1 : 0);
+  Serial.print("PARAM BARO_OVERSAMPLING "); Serial.println(16);
+  Serial.print("PARAM BARO_FILTER "); Serial.println("MEDIAN3+IIR_0.65");
+  Serial.print("PARAM BARO_FRESH_SAMPLES "); Serial.println((unsigned long)baroFreshSamples);
+  Serial.print("PARAM BARO_TIMEOUTS "); Serial.println((unsigned long)baroTimeouts);
+  Serial.print("PARAM HEARTBEAT_PERIOD_MS "); Serial.println((unsigned long)HEARTBEAT_PERIOD_MS);
+  Serial.print("PARAM LOCKOUT_MS "); Serial.println((unsigned long)flightLockoutMs);
+  Serial.print("PARAM DROGUE_MAIN_GAP_MS "); Serial.println((unsigned long)drogueMainGapMs);
   Serial.print("PARAM DROGUE_BACKUP_MS "); Serial.println((unsigned long)drogueBackupMs);
   Serial.print("PARAM MAIN_BACKUP_MS "); Serial.println((unsigned long)mainBackupMs);
   Serial.println("Backup delays are measured from LAUNCH, NOT from apogee/drogue.");
@@ -2020,6 +2092,21 @@ bool parseBackupMilliseconds(const String& input, uint32_t& milliseconds) {
   long n = v.toInt();
   if (n < 1000L || n > 600000L) return false;
   milliseconds = (uint32_t)n;
+  return true;
+}
+
+// Safety timings use whole seconds so the existing packed 1-byte profile
+// reserve can hold 1..60s of command separation without changing file layout.
+bool parseSafetyMilliseconds(const String& input, uint32_t& out,
+                             uint32_t minimum, uint32_t maximum, bool wholeSeconds) {
+  String v = input;
+  v.trim();
+  if (v.length() == 0 || v.length() > 6) return false;
+  for (unsigned i = 0; i < v.length(); ++i) if (!isDigit(v[i])) return false;
+  long n = v.toInt();
+  if (n < (long)minimum || n > (long)maximum) return false;
+  if (wholeSeconds && n % 1000L != 0) return false;
+  out = (uint32_t)n;
   return true;
 }
 
@@ -2062,6 +2149,16 @@ bool setParam(const String& name, const String& value) {
     }
     timerMethodsEnabled = enabled;
     changed = true;
+  } else if (name == "LOCKOUT_MS") {
+    uint32_t ms;
+    if (!parseSafetyMilliseconds(value, ms, 0UL, 120000UL, false)) return false;
+    flightLockoutMs = ms;
+    changed = true;
+  } else if (name == "DROGUE_MAIN_GAP_MS") {
+    uint32_t ms;
+    if (!parseSafetyMilliseconds(value, ms, 1000UL, 60000UL, true)) return false;
+    drogueMainGapMs = ms;
+    changed = true;
   } else if (name == "DROGUE_BACKUP_MS" || name == "MAIN_BACKUP_MS") {
     uint32_t ms;
     if (!parseBackupMilliseconds(value, ms)) return false;
@@ -2090,6 +2187,8 @@ void printProfile(uint8_t mode) {
   Serial.print(" MAIN_ALT "); Serial.print(comet_recovery::Logic::target(p.mainAltM), 3);
   Serial.print(" ACCEL_ENABLE "); Serial.print(p.accelEnabled ? 1 : 0);
   Serial.print(" TIMER_ENABLE "); Serial.print(p.timerEnabled ? 1 : 0);
+  Serial.print(" LOCKOUT_MS "); Serial.print((unsigned long)p.flightLockoutMs);
+  Serial.print(" DROGUE_MAIN_GAP_MS "); Serial.print((unsigned long)p.minDrogueMainGapS * 1000UL);
   Serial.print(" DROGUE_BACKUP_MS "); Serial.print((unsigned long)p.drogueBackupMs);
   Serial.print(" MAIN_BACKUP_MS "); Serial.println((unsigned long)p.mainBackupMs);
 }
@@ -2109,6 +2208,13 @@ bool setProfileParam(uint8_t mode, const String& name, const String& value) {
     bool v;
     if (!parseEnableValue(value, v)) return false;
     candidate.timerEnabled = v ? 1 : 0;
+  } else if (name == "LOCKOUT_MS" || name == "DROGUE_MAIN_GAP_MS") {
+    uint32_t ms;
+    bool gap = name == "DROGUE_MAIN_GAP_MS";
+    if (!parseSafetyMilliseconds(value, ms, gap ? 1000UL : 0UL,
+                                 gap ? 60000UL : 120000UL, gap)) return false;
+    if (gap) candidate.minDrogueMainGapS = (uint8_t)(ms / 1000UL);
+    else candidate.flightLockoutMs = ms;
   } else if (name == "DROGUE_BACKUP_MS" || name == "MAIN_BACKUP_MS") {
     uint32_t ms;
     if (!parseBackupMilliseconds(value, ms)) return false;
@@ -2144,6 +2250,9 @@ void printLoggerHelp() {
   Serial.println("  STOPLOG / STARTLOG    - manual bench flight logging");
   Serial.println("  LOGSTATUS             - show LittleFS size, usage, 80% budget");
   Serial.println("  GETPARAMS, SET MAIN_ALT, SET ACCEL_ENABLE, PROFILE ...");
+  Serial.println("  SET LOCKOUT_MS 10000 - minimum time after launch before AUTO pyro commands");
+  Serial.println("  SET DROGUE_MAIN_GAP_MS 3000 - main >= 3 seconds after drogue command");
+  Serial.println("  PROFILE SET <COLOR> LOCKOUT_MS 10000 / DROGUE_MAIN_GAP_MS 3000");
   Serial.println("  SET TIMER_ENABLE 0|1       - default OFF; enables both launch-relative backups");
   Serial.println("  SET DROGUE_BACKUP_MS 15000 - drogue timer after launch, 1..600 s");
   Serial.println("  SET MAIN_BACKUP_MS 25000   - main timer after launch, only after drogue");
@@ -2493,9 +2602,12 @@ bool readSensors() {
     float absAlt = 0.0f;
     float tempC = 0.0f;
 
-    if (readMPLFast(absAlt, tempC)) {
-      alt_m = safe0(absAlt - altRef_m);
-      mplTemp_C = safe0(tempC);
+    if (pollMPLFresh(now, absAlt, tempC)) {
+      rawAltRel_m = absAlt - altRef_m;
+      // The same filtered altitude is used for telemetry, AGL, logs,
+      // apogee and landing stability (not a clamped or fake zero).
+      alt_m = altitudeFilter.update(rawAltRel_m);
+      mplTemp_C = tempC;
       baroUpdated = true;
       latestBaroReadMs = now;
     }
@@ -2664,7 +2776,7 @@ void sendTelemetry(const char* eventName = nullptr) {
 
   float outAlt_m = (t_launch > 0) ? altAGL_m : alt_m;
 
-  char pkt[520];
+  char pkt[680];
 
   // VZNEG in the legacy packet is informational; no old negative-Vz gate exists.
   // Keep this line parser-friendly for the COMET Python GUI:
@@ -2698,7 +2810,12 @@ void sendTelemetry(const char* eventName = nullptr) {
     "PYRO:%u:"
     "LOG:%u:"
     "SLOT:%d:"
-    "REC:%lu",
+    "REC:%lu:"
+    "ALT_RAW:%.2f:"
+    "BARO_AGE_MS:%lu:"
+    "BARO_SAMPLES:%lu:"
+    "PYRO_KIND:%s:"
+    "PYRO_OUTPUTS:%u",
     (unsigned long)now,
     stateStr(state),
     eventName ? eventName : "-",
@@ -2726,7 +2843,12 @@ void sendTelemetry(const char* eventName = nullptr) {
     pyroActive() ? 1 : 0,
     loggerActive ? 1 : 0,
     activeSlot,
-    (unsigned long)activeHeader.recordCount
+    (unsigned long)activeHeader.recordCount,
+    safe0(rawAltRel_m),
+    latestBaroReadMs ? (unsigned long)(now - latestBaroReadMs) : 0xFFFFFFFFUL,
+    (unsigned long)baroFreshSamples,
+    pyro.active ? (pyro.kind == PyroKind::DROGUE ? "DROGUE" : "MAIN") : "NONE",
+    PYRO_OUTPUTS_ENABLED ? 1 : 0
   );
 
   Serial.println(pkt);
@@ -2752,6 +2874,11 @@ bool deployDrogue(const char* reason, bool force = false) {
 bool deployMain(const char* reason, bool force = false) {
   (void)force;
   if (mainFired || pyroActive()) return false;
+  if (!comet_backup::mainAfterDrogueAllowed(drogueFired, millis(),
+                                              t_drogue_fire, drogueMainGapMs)) {
+    Serial.println("MAIN INHIBITED: minimum interval after drogue has not elapsed.");
+    return false;
+  }
   mainFired = true;
   t_main_fire = millis();
   Serial.print(">>> MAIN DEPLOY CMD: "); Serial.println(reason ? reason : "-");
@@ -2765,6 +2892,12 @@ bool deployMain(const char* reason, bool force = false) {
 // advancing the state as though the deployment had occurred.
 void serviceRecoveryRequests() {
   if (pyroActive()) return;
+  // Delay automatic requests (including both timer backups and the 200 m
+  // barometric backstop), not sensor detection or logging. Pending requests
+  // remain latched until accepted. This delay trades false ground firings
+  // against late recovery on a genuinely short/low flight.
+  if (!comet_backup::autoDeploymentAllowed(t_launch > 0, millis(),
+                                           t_launch, flightLockoutMs)) return;
   if (pendingDrogueRequest) {
     if (drogueFired) pendingDrogueRequest = false;
     else if (deployDrogue(pendingDrogueReason, true)) {
@@ -2986,23 +3119,23 @@ void setup() {
       float sumAlt = 0.0f;
       float lastTemp = 0.0f;
       int samples = 0;
-
-      for (int i = 0; i < 10; i++) {
-        float a = 0.0f;
-        float t = 0.0f;
-        if (readMPLFast(a, t)) {
-          sumAlt += a;
-          lastTemp = t;
-          samples++;
+      uint32_t baselineBegin = millis();
+      while (samples < 10 && (uint32_t)(millis() - baselineBegin) < 2600UL) {
+        float a = 0.0f, t = 0.0f;
+        if (pollMPLFresh(millis(), a, t)) {
+          sumAlt += a; lastTemp = t; samples++;
         }
-        delay(20);
+        delay(5);
       }
-
-      if (samples > 0) {
+      if (samples >= 7) {
         altRef_m = sumAlt / samples;
         mplTemp_C = lastTemp;
+        rawAltRel_m = 0.0f;
+        altitudeFilter.reset(0.0f);
+        alt_m = 0.0f;
+        Serial.print("Fresh baseline samples: "); Serial.println(samples);
       } else {
-        Serial.println("MPL3115A2 baseline read failed; deployment logic disabled.");
+        Serial.println("MPL3115A2 fresh baseline failed; deployment disabled.");
         mplOK = false;
       }
 
@@ -3085,6 +3218,8 @@ void setup() {
 
   printHelp();
   printLoggerHelp();
+  Serial.println("SAFETY: Vigorous shaking can trigger LAUNCH. Lockout and gap DELAY commands, not disarm outputs.");
+  Serial.println("SAFETY: IDLE heartbeat means firmware active, NOT pyrotechnic continuity/arming.");
 
   sendTelemetry("BOOT_READY");
 }
@@ -3099,6 +3234,7 @@ void loop() {
   // Flight-critical output shutdown gets first CPU priority every pass.
   servicePyro(now);
   serviceBuzzer(now);
+  serviceHeartbeat(now); // quiet IDLE chirp; never preempts warnings
 
   // Keep newly-added UI/filesystem management activity out of the actual
   // pyro pulse. The proven sensor/logger/state-machine path below is left
