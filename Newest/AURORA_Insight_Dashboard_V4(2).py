@@ -89,6 +89,8 @@ SEARCH_RADIUS_M = 30.0      # search circle drawn around the landing spot in Goo
 LIVE_KML_EVERY_S = 3.0      # how often the live Google Earth file is rewritten
 KML_MAX_POINTS = 2000       # flight-path points written to KML (decimated)
 TRACKER_KMZ = "rocket_track.kmz"   # name of the Google Earth file served to phones
+WEB_STATE_EVERY_S = 0.5     # rocket_state.json (read by the phone tracker) refresh interval
+WEB_TRAIL_MAX = 1500        # rocket track points kept for the phone map
 LIVE_PLOT = True
 USE_OPENGL = True           # set False (or --no-gl) if plots misbehave
 START_FULLSCREEN = False
@@ -1648,6 +1650,8 @@ class TelemetryReceiver:
 
         # GPS tracking data
         self.rocket_positions = deque(maxlen=200)
+        self.web_trail = deque(maxlen=WEB_TRAIL_MAX)   # (lat, lon) whenever the rocket moved > 2 m
+        self._web_state_t = 0.0
         self.receiver_positions = deque(maxlen=200)
         self.distance_history = deque(maxlen=MAX_PLOT_POINTS)
         self.bearing_history = deque(maxlen=MAX_PLOT_POINTS)
@@ -1942,6 +1946,7 @@ class TelemetryReceiver:
             self.report_paths = None
             self._report_due = None
             self.flight_rec.clear()
+            self.web_trail.clear()
             self.kmz_path = None
             self.launch_time = None
             self._launch_entry_t = None
@@ -2178,6 +2183,55 @@ class TelemetryReceiver:
             else:
                 self.bad_packets += 1
 
+        self.write_web_state()
+
+    def write_web_state(self):
+        """rocket_state.json for the phone tracker. Old fields kept so older pages still work."""
+        now = time.time()
+        if not self.web_dir_ok or now - self._web_state_t < WEB_STATE_EVERY_S:
+            return
+        self._web_state_t = now
+        with self.data_lock:
+            fix = self.last_rocket_fix
+            trail = list(self.web_trail)
+            if len(trail) > 400:
+                step = int(math.ceil(len(trail) / 400))
+                trail = trail[::step] + [trail[-1]]
+            rx_pos = self.receiver_positions[-1] if (self.receiver_has_fix and self.receiver_positions) else None
+            bat = self.all_data['Battery'][-1] if self.all_data['Battery'] else None
+            spd = self.all_data['Speed'][-1] if self.all_data['Speed'] else None
+            state = {
+                # legacy fields (original tracker page)
+                "rocket_lat": round(fix[0], 7) if fix else None,
+                "rocket_lon": round(fix[1], 7) if fix else None,
+                "alt": round(fix[2], 1) if fix else None,
+                "updated": fix[3] if fix else None,
+                # V4 fields
+                "v": 4,
+                "written": now,                                  # Pi clock; page detects a stalled file
+                "fix_age": round(now - fix[3], 2) if fix else None,
+                "link_age": round(now - self.last_packet_time, 2) if self.last_packet_time else None,
+                "phase": self.flight_phase,
+                "agl": round(self.current_agl, 1) if self.all_time else None,
+                "vs": round(self.vs_smooth, 1) if self.all_time else None,
+                "max_agl": round(self.max_agl, 1),
+                "speed_kmh": round(spd, 1) if (spd is not None and spd >= 0) else None,
+                "rssi": self.current_rssi, "snr": self.current_snr,
+                "battery": round(bat, 2) if bat is not None else None,
+                "landed": self.landing_pos is not None,
+                "landing": [round(self.landing_pos[0], 7), round(self.landing_pos[1], 7)] if self.landing_pos else None,
+                "pad": [round(self.track_origin[0], 7), round(self.track_origin[1], 7)] if self.track_origin else None,
+                "receiver": [round(rx_pos[0], 7), round(rx_pos[1], 7)] if rx_pos else None,
+                "trail": [[round(a, 7), round(b_, 7)] for a, b_ in trail],
+                "kmz": os.path.exists(os.path.join(WEB_DIR, TRACKER_KMZ)),
+            }
+        try:
+            write_text_atomic(os.path.join(WEB_DIR, "rocket_state.json"), json.dumps(state, separators=(',', ':')))
+        except Exception as e:
+            self._state_write_errors += 1
+            if self._state_write_errors <= 3:
+                self.add_terminal_message(f"Rocket state write error: {e}")
+
     def process_data(self, tx_timestamp, values, nav_data, recv_time=None):
         with self.data_lock:
             if self.start_time is None:
@@ -2250,25 +2304,9 @@ class TelemetryReceiver:
                 self.gps_lons.append(lon)
                 self.gps_alts.append(alt)
 
-                # --- write rocket_state.json for web tracker ---
-                if self.web_dir_ok:
-                    try:
-                        state = {
-                            "rocket_lat": float(lat),
-                            "rocket_lon": float(lon),
-                            "alt": float(alt) if alt is not None else 0.0,
-                            "updated": time.time()
-                        }
-                        out_path = os.path.join(WEB_DIR, "rocket_state.json")
-                        tmp_path = out_path + ".tmp"
-                        with open(tmp_path, "w") as f:
-                            json.dump(state, f)
-                        os.replace(tmp_path, out_path)   # atomic: tracker never reads half a file
-                    except Exception as e:
-                        self._state_write_errors += 1
-                        if self._state_write_errors <= 3:
-                            self.add_terminal_message(f"Rocket state write error: {e}")
-                # --- end block ---
+                # track for the phone map (rocket_state.json is written by write_web_state)
+                if not self.web_trail or math.hypot(*local_xy(lat, lon, *self.web_trail[-1])) > 2.0:
+                    self.web_trail.append((lat, lon))
 
             # compact full-rate record for the flight report
             ok_fix = abs(lat) > 0.001 and abs(lon) > 0.001
