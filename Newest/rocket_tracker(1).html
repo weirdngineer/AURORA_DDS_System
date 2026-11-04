@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>AURORA Tracker</title>
+<!--
+  AURORA Insight - phone rocket tracker (V4)
+  Served by the Pi dashboard from WEB_DIR (default /home/weirdngineer/aurora_web).
+  Reads rocket_state.json (V4 dashboard adds trail / phase / landing / link info,
+  but the page still works with the old lat/lon-only file).
+  No external libraries: map tiles load when the phone has internet, otherwise
+  the map falls back to an offline radar view.
+-->
+<style>
+  :root {
+    --bg:#000; --panel:#0a0a0a; --panel2:#151515; --border:#242424;
+    --text:#f4f4f4; --muted:#8e8e8e; --dim:#4a4a4a;
+    --red:#ff1a2e; --red-dk:#7a0a14; --amber:#ffb020;
+    --mono: "DejaVu Sans Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { margin:0; background:var(--bg); color:var(--text);
+    font-family: "DejaVu Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+  .wrap { max-width:640px; margin:0 auto; padding:0 12px 24px; }
+
+  /* header */
+  header { position:sticky; top:0; z-index:20; background:rgba(0,0,0,.92);
+    backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
+    border-bottom:2px solid var(--red); }
+  .hdr { max-width:640px; margin:0 auto; padding:10px 12px; display:flex; align-items:center; gap:10px; }
+  .logo { font-weight:900; font-size:20px; letter-spacing:2px; white-space:nowrap; }
+  .logo span { color:var(--red); font-size:10px; letter-spacing:3px; margin-left:6px; vertical-align:middle; font-weight:700; }
+  .grow { flex:1; }
+  .pill { font-size:11px; font-weight:800; letter-spacing:1.5px; padding:4px 9px; border-radius:3px;
+    background:#1c1c1c; color:var(--muted); white-space:nowrap; }
+  .pill.live { background:var(--red); color:#fff; }
+  .pill.warn { background:var(--amber); color:#000; }
+  .pill.white { background:#fff; color:#000; }
+  .dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:currentColor; margin-right:5px;
+    vertical-align:1px; }
+  .pill.live .dot { animation:blink 1.2s infinite; }
+  @keyframes blink { 50% { opacity:.25; } }
+
+  /* panels */
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:6px; margin-top:12px; padding:12px; }
+  .ptitle { color:var(--muted); font-size:11px; font-weight:800; letter-spacing:2px; text-transform:uppercase;
+    display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .ptitle .grow { flex:1; }
+
+  /* start */
+  #start { border-top:3px solid var(--red); text-align:center; padding:18px 14px; }
+  #start h2 { margin:0 0 6px; font-size:18px; letter-spacing:1px; }
+  #start p { margin:0 0 14px; color:var(--muted); font-size:14px; line-height:1.4; }
+
+  button, .btn { font:inherit; font-weight:800; letter-spacing:1px; font-size:13px; color:var(--text);
+    background:var(--panel2); border:1px solid var(--border); border-radius:4px; padding:10px 12px;
+    text-decoration:none; display:inline-flex; align-items:center; justify-content:center; gap:6px; cursor:pointer; }
+  button:active, .btn:active { background:var(--red-dk); }
+  .btn.primary, button.primary { background:var(--red); border-color:var(--red); color:#fff; }
+  button.big { font-size:17px; padding:14px 22px; width:100%; }
+  .seg { display:inline-flex; border:1px solid var(--border); border-radius:4px; overflow:hidden; }
+  .seg button { border:0; border-radius:0; padding:6px 9px; font-size:11px; background:rgba(21,21,21,.92); }
+  .seg button.on { background:var(--red); color:#fff; }
+
+  /* hero */
+  #landed { display:none; background:var(--red); color:#fff; border-radius:6px; margin-top:12px; padding:10px 12px;
+    font-weight:900; letter-spacing:2px; text-align:center; }
+  .hero { display:grid; grid-template-columns: 1fr auto; gap:10px; align-items:center; border-top:3px solid var(--red); }
+  .dist { font-family:var(--mono); font-weight:800; font-size:64px; line-height:1; letter-spacing:-1px; }
+  .dist small { font-family:inherit; font-size:20px; color:var(--muted); margin-left:4px; letter-spacing:0; }
+  .sub { color:var(--muted); font-size:14px; margin-top:6px; }
+  .turn { font-size:20px; font-weight:900; letter-spacing:1px; margin-top:10px; }
+  .turn.ok { color:#fff; } .turn.go { color:var(--amber); }
+  .note { color:var(--muted); font-size:12px; margin-top:6px; line-height:1.35; }
+  #dial { width:150px; height:150px; display:block; }
+  @media (max-width:380px) { .dist { font-size:52px; } #dial { width:124px; height:124px; } }
+
+  /* map */
+  .mapbox { position:relative; margin:0 -12px -12px; height:min(78vw, 470px); min-height:280px;
+    border-top:1px solid var(--border); overflow:hidden; border-radius:0 0 6px 6px; touch-action:none; }
+  #map { width:100%; height:100%; display:block; background:#050505; }
+  .mtools { position:absolute; top:8px; left:8px; right:8px; display:flex; gap:6px; flex-wrap:wrap; pointer-events:none; }
+  .mtools > * { pointer-events:auto; }
+  .mzoom { position:absolute; right:8px; bottom:28px; display:flex; flex-direction:column; gap:6px; }
+  .mzoom button { width:40px; height:40px; padding:0; font-size:20px; background:rgba(21,21,21,.92); }
+  #fitbtn { font-size:11px; }
+  #mapnote { position:absolute; left:8px; bottom:28px; right:60px; font-size:11px; color:var(--amber);
+    text-shadow:0 0 3px #000; pointer-events:none; }
+
+  /* coords */
+  .coords { font-family:var(--mono); font-weight:800; font-size:26px; line-height:1.25; }
+  .coords .k { color:var(--red); font-family:"DejaVu Sans", system-ui, sans-serif; font-size:12px;
+    letter-spacing:2px; display:inline-block; width:40px; }
+  .dms { font-family:var(--mono); color:var(--muted); font-size:12px; margin-top:4px; }
+  .actions { display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-top:12px; }
+  .actions .btn, .actions button { padding:11px 6px; font-size:12px; }
+
+  /* telemetry grid */
+  .grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:10px 12px; }
+  .cell .k { color:var(--muted); font-size:10px; font-weight:800; letter-spacing:1px; }
+  .cell .v { font-family:var(--mono); font-weight:800; font-size:18px; margin-top:2px; white-space:nowrap; }
+
+  details { margin-top:12px; color:var(--muted); font-size:12px; }
+  summary { cursor:pointer; font-weight:800; letter-spacing:1px; }
+  #debug { font-family:var(--mono); white-space:pre-wrap; margin-top:6px; }
+  .toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:#fff; color:#000;
+    font-weight:800; padding:10px 16px; border-radius:4px; opacity:0; transition:opacity .2s; z-index:50; }
+  .toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<header><div class="hdr">
+  <div class="logo">AURORA<span>TRACKER</span></div>
+  <div class="grow"></div>
+  <div id="phase" class="pill">--</div>
+  <div id="link" class="pill"><span class="dot"></span>CONNECTING</div>
+</div></header>
+
+<div class="wrap">
+  <div id="start" class="panel">
+    <h2>Find the rocket</h2>
+    <p>Uses your phone's GPS and compass to point you to the rocket.<br>Keep this page open; the screen stays on.</p>
+    <button id="startbtn" class="primary big">START TRACKING</button>
+    <div id="perm" class="note"></div>
+  </div>
+
+  <div id="landed">ROCKET LANDED &mdash; GO GET IT</div>
+
+  <div class="panel hero">
+    <div>
+      <div class="ptitle" id="disttitle">Distance to rocket</div>
+      <div class="dist" id="dist">--<small>m</small></div>
+      <div class="sub" id="distsub">waiting for positions</div>
+      <div class="turn" id="turn"></div>
+      <div class="note" id="dialnote"></div>
+    </div>
+    <svg id="dial" viewBox="-110 -110 220 220" aria-label="Direction to rocket">
+      <circle r="104" fill="#0f0f0f" stroke="#2a2a2a" stroke-width="3"/>
+      <g id="ring"></g>
+      <polygon points="0,-108 -7,-121 7,-121" fill="#fff"/>
+      <g id="arrow" style="transition:transform .25s ease-out">
+        <polygon points="0,-82 20,-36 7,-42 7,30 -7,30 -7,-42 -20,-36" fill="#ff1a2e" stroke="#000" stroke-width="2"/>
+      </g>
+      <circle r="9" fill="#fff" stroke="#000" stroke-width="2"/>
+    </svg>
+  </div>
+
+  <div class="panel">
+    <div class="ptitle">Live map <span class="grow"></span><span id="maplabel" style="letter-spacing:1px"></span></div>
+    <div class="mapbox" id="mapbox">
+      <canvas id="map"></canvas>
+      <div class="mtools">
+        <div class="seg" id="layerseg">
+          <button data-l="sat" class="on">SAT</button><button data-l="map">MAP</button><button data-l="radar">RADAR</button>
+        </div>
+        <div class="seg" id="orientseg">
+          <button data-o="north" class="on">N&uarr;</button><button data-o="hdg">HDG</button>
+        </div>
+      </div>
+      <div class="mzoom">
+        <button id="zin">+</button><button id="zout">&minus;</button><button id="fitbtn">FIT</button>
+      </div>
+      <div id="mapnote"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="ptitle"><span id="coordtitle">Rocket position</span><span class="grow"></span><span id="fixage"></span></div>
+    <div class="coords"><span class="k">LAT</span><span id="lat">--</span><br><span class="k">LON</span><span id="lon">--</span></div>
+    <div class="dms" id="dms"></div>
+    <div class="actions">
+      <a class="btn primary" id="navbtn" href="#" target="_blank" rel="noopener">NAVIGATE</a>
+      <button id="copybtn">COPY</button>
+      <a class="btn" id="earthbtn" href="rocket_track.kmz" download>EARTH</a>
+    </div>
+  </div>
+
+  <div class="panel" id="telpanel">
+    <div class="ptitle">Rocket telemetry</div>
+    <div class="grid">
+      <div class="cell"><div class="k">ALTITUDE AGL</div><div class="v" id="t_agl">--</div></div>
+      <div class="cell"><div class="k">VERT SPEED</div><div class="v" id="t_vs">--</div></div>
+      <div class="cell"><div class="k">APOGEE</div><div class="v" id="t_apo">--</div></div>
+      <div class="cell"><div class="k">GPS SPEED</div><div class="v" id="t_spd">--</div></div>
+      <div class="cell"><div class="k">SIGNAL</div><div class="v" id="t_sig">--</div></div>
+      <div class="cell"><div class="k">BATTERY</div><div class="v" id="t_bat">--</div></div>
+    </div>
+  </div>
+
+  <details>
+    <summary>SENSOR DEBUG</summary>
+    <div id="debug"></div>
+  </details>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const RAD = Math.PI / 180;
+
+// ---------------- state ----------------
+const S = {
+  me: null, meAcc: null,                 // phone GPS
+  heading: null, hdgSrc: null, hx: null, hy: null, oriEvents: 0,
+  st: null, stOk: 0, stFail: 0, lastFetchOk: 0,
+  writtenVal: null, writtenSeenAt: 0,    // detect a stalled rocket_state.json
+  started: false, startedAt: 0,
+};
+
+// ---------------- geo helpers ----------------
+function haversine(a, b) {
+  const R = 6371000, dLat = (b[0] - a[0]) * RAD, dLon = (b[1] - a[1]) * RAD;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a[0] * RAD) * Math.cos(b[0] * RAD) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+function bearing(a, b) {
+  const p1 = a[0] * RAD, p2 = b[0] * RAD, dl = (b[1] - a[1]) * RAD;
+  const y = Math.sin(dl) * Math.cos(p2);
+  const x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+  return (Math.atan2(y, x) / RAD + 360) % 360;
+}
+const DIRS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+const dir8 = b => DIRS[Math.round(((b % 360) + 360) % 360 / 45) % 8];
+function fmtDist(m) {
+  if (m == null || !isFinite(m)) return ["--", "m"];
+  return m >= 1000 ? [(m / 1000).toFixed(2), "km"] : [m.toFixed(0), "m"];
+}
+function dms(v, pos, neg) {
+  const h = v >= 0 ? pos : neg; v = Math.abs(v);
+  const d = Math.floor(v), mf = (v - d) * 60, m = Math.floor(mf), s = (mf - m) * 60;
+  return `${d}°${String(m).padStart(2, "0")}'${s.toFixed(1).padStart(4, "0")}"${h}`;
+}
+const num = v => typeof v === "number" && isFinite(v);
+const pair = p => Array.isArray(p) && num(p[0]) && num(p[1]) && (Math.abs(p[0]) > 0.001 || Math.abs(p[1]) > 0.001);
+function fmtAge(s) {
+  if (s == null || !isFinite(s)) return "";
+  if (s < 60) return s.toFixed(s < 10 ? 1 : 0) + " s ago";
+  return Math.floor(s / 60) + " min " + Math.floor(s % 60) + " s ago";
+}
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), 1600);
+}
+
+// ---------------- rocket state polling ----------------
+function rocketPos() {
+  const st = S.st; if (!st) return null;
+  if (st.landed && pair(st.landing)) return st.landing;
+  if (num(st.rocket_lat) && num(st.rocket_lon) && (Math.abs(st.rocket_lat) > 0.001 || Math.abs(st.rocket_lon) > 0.001))
+    return [st.rocket_lat, st.rocket_lon];
+  return null;
+}
+async function poll() {
+  try {
+    const r = await fetch("rocket_state.json?ts=" + Date.now(), { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const st = await r.json();
+    const stamp = num(st.written) ? st.written : st.updated;
+    if (stamp !== S.writtenVal) { S.writtenVal = stamp; S.writtenSeenAt = Date.now(); }
+    S.st = st; S.stOk++; S.lastFetchOk = Date.now();
+  } catch (e) {
+    S.stFail++;
+  }
+  render();
+}
+
+// link status shown in the header
+function linkStatus() {
+  const now = Date.now();
+  if (!S.lastFetchOk || now - S.lastFetchOk > 5000) return ["NO PI", ""];
+  const st = S.st;
+  const fileAge = (now - S.writtenSeenAt) / 1000;
+  if (st && num(st.written)) {
+    if (fileAge > 5) return ["DASH STOPPED", "warn"];
+    const la = num(st.link_age) ? st.link_age + fileAge : null;
+    if (la == null) return ["NO DATA", ""];
+    if (la < 1.5) return ["LIVE", "live"];
+    if (la < 4) return ["WEAK", "warn"];
+    return ["LINK LOST", "warn"];
+  }
+  // legacy file: only knows when the rocket position last changed
+  return fileAge < 3 ? ["LIVE", "live"] : ["STALE", "warn"];
+}
+
+// ---------------- phone GPS + compass ----------------
+function startLocation() {
+  if (!navigator.geolocation) { $("perm").textContent = "This browser has no GPS access."; return; }
+  navigator.geolocation.watchPosition(p => {
+    S.me = [p.coords.latitude, p.coords.longitude]; S.meAcc = p.coords.accuracy;
+    render();
+  }, err => {
+    $("perm").textContent = "Location: " + err.message + " (allow location for this site)";
+  }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 15000 });
+}
+function onOrientation(e) {
+  S.oriEvents++;
+  let h = null;
+  if (num(e.webkitCompassHeading)) { h = e.webkitCompassHeading; S.hdgSrc = "iOS compass"; }
+  else if (num(e.alpha) && (e.absolute || e.type === "deviceorientationabsolute")) { h = 360 - e.alpha; S.hdgSrc = "absolute"; }
+  else if (num(e.alpha)) { h = 360 - e.alpha; S.hdgSrc = "relative (not north-referenced)"; }
+  if (h == null) return;
+  const so = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
+  h = ((h + so) % 360 + 360) % 360;
+  // smooth on the circle (no 359 -> 0 jump)
+  const x = Math.cos(h * RAD), y = Math.sin(h * RAD), k = 0.25;
+  S.hx = S.hx == null ? x : S.hx + k * (x - S.hx);
+  S.hy = S.hy == null ? y : S.hy + k * (y - S.hy);
+  S.heading = (Math.atan2(S.hy, S.hx) / RAD + 360) % 360;
+  scheduleRender();
+}
+function startCompass() {
+  const listen = () => {
+    if ("ondeviceorientationabsolute" in window) addEventListener("deviceorientationabsolute", onOrientation, true);
+    else addEventListener("deviceorientation", onOrientation, true);
+  };
+  if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
+    // iOS asks the user here. Some Chromium builds also expose this and answer "prompt",
+    // so always listen; only warn if the answer is an explicit "denied".
+    DeviceOrientationEvent.requestPermission()
+      .then(r => { if (r === "denied") $("perm").textContent = "Compass permission denied - arrow will be north-up."; listen(); })
+      .catch(() => listen());
+  } else if (typeof DeviceOrientationEvent !== "undefined") listen();
+}
+let wakeLock = null;
+async function keepAwake() {
+  try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+}
+document.addEventListener("visibilitychange", () => { if (S.started && document.visibilityState === "visible") keepAwake(); });
+
+$("startbtn").addEventListener("click", () => {
+  startCompass();          // must run inside the tap for iOS
+  startLocation();
+  keepAwake();
+  S.started = true; S.startedAt = Date.now();
+  $("start").style.display = "none";
+  try { localStorage.setItem("aurora_started", "1"); } catch (e) {}
+});
+
+// ---------------- dial ----------------
+(function buildDial() {
+  const g = $("ring"); let h = "";
+  for (let a = 0; a < 360; a += 10) {
+    const major = a % 30 === 0, r1 = 100, r2 = major ? 88 : 94;
+    const s = Math.sin(a * RAD), c = -Math.cos(a * RAD);
+    h += `<line x1="${s * r1}" y1="${c * r1}" x2="${s * r2}" y2="${c * r2}" stroke="${major ? "#8e8e8e" : "#4a4a4a"}" stroke-width="${major ? 3 : 1.5}"/>`;
+  }
+  for (const [a, n] of [[0, "N"], [90, "E"], [180, "S"], [270, "W"]]) {
+    const s = Math.sin(a * RAD) * 70, c = -Math.cos(a * RAD) * 70;
+    h += `<text x="${s}" y="${c}" text-anchor="middle" dominant-baseline="central" font-size="17" font-weight="800"
+          fill="${n === "N" ? "#ff1a2e" : "#8e8e8e"}" transform="rotate(${-a} ${s} ${c}) rotate(${a} ${s} ${c})">${n}</text>`;
+  }
+  g.innerHTML = h;
+})();
+let arrowAngle = 0;
+function setArrow(target) {   // shortest rotation so the CSS transition never spins the long way
+  let d = ((target - arrowAngle) % 360 + 540) % 360 - 180;
+  arrowAngle += d;
+  $("arrow").style.transform = `rotate(${arrowAngle}deg)`;
+}
+
+// ---------------- main render ----------------
+let renderQueued = false;
+function scheduleRender() { if (!renderQueued) { renderQueued = true; requestAnimationFrame(() => { renderQueued = false; render(); }); } }
+
+function render() {
+  const st = S.st || {};
+  // header pills
+  const [ltxt, lcls] = linkStatus();
+  const L = $("link"); L.className = "pill " + lcls; L.innerHTML = `<span class="dot"></span>${ltxt}`;
+  const P = $("phase");
+  if (st.phase) {
+    P.style.display = "";
+    P.textContent = st.phase.toUpperCase();
+    P.className = "pill " + ({ Launch: "live", Ascent: "live", Descent: "white" }[st.phase] || "");
+  } else P.style.display = "none";
+  $("landed").style.display = st.landed ? "block" : "none";
+
+  const rp = rocketPos();
+  const from = S.me || (pair(st.receiver) ? st.receiver : null);
+  const fromLabel = S.me ? "you" : "receiver";
+
+  // hero
+  if (rp && from) {
+    const d = haversine(from, rp), b = bearing(from, rp);
+    const [v, u] = fmtDist(d);
+    $("dist").innerHTML = `${v}<small>${u}</small>`;
+    $("distsub").textContent = `${b.toFixed(0)}° ${dir8(b)} of ${fromLabel}` + (d >= 1000 ? "" : ` · ${(d * 3.28084).toFixed(0)} ft`);
+    $("disttitle").textContent = S.me ? "Distance to rocket" : "Distance from receiver";
+    if (S.heading != null) {
+      let rel = ((b - S.heading) % 360 + 540) % 360 - 180;
+      setArrow(rel);
+      $("ring").setAttribute("transform", `rotate(${-S.heading})`);
+      const T = $("turn");
+      if (d < 8) { T.textContent = "YOU'RE THERE - LOOK AROUND"; T.className = "turn ok"; }
+      else if (Math.abs(rel) < 12) { T.textContent = "▲ STRAIGHT AHEAD"; T.className = "turn ok"; }
+      else if (rel < 0) { T.textContent = `◀ TURN LEFT ${Math.abs(rel).toFixed(0)}°`; T.className = "turn go"; }
+      else { T.textContent = `TURN RIGHT ${rel.toFixed(0)}° ▶`; T.className = "turn go"; }
+      $("dialnote").textContent = S.hdgSrc && S.hdgSrc.startsWith("relative") ? "Compass may not point to true north on this phone." : "";
+    } else {
+      setArrow(b);
+      $("ring").setAttribute("transform", "");
+      $("turn").textContent = "";
+      $("dialnote").textContent = !S.started ? "Tap START TRACKING to use your compass."
+        : (Date.now() - S.startedAt < 4000 ? "Waiting for compass..." : "No compass reading: arrow is relative to NORTH (top).");
+    }
+  } else {
+    $("dist").innerHTML = `--<small>m</small>`;
+    $("distsub").textContent = !rp ? "waiting for rocket GPS" : (S.started ? "waiting for your GPS" : "tap START TRACKING");
+    $("turn").textContent = "";
+  }
+
+  // coordinates
+  if (rp) {
+    $("lat").textContent = `${Math.abs(rp[0]).toFixed(6)}°${rp[0] >= 0 ? "N" : "S"}`;
+    $("lon").textContent = `${Math.abs(rp[1]).toFixed(6)}°${rp[1] >= 0 ? "E" : "W"}`;
+    $("dms").textContent = `${dms(rp[0], "N", "S")}   ${dms(rp[1], "E", "W")}`;
+    $("navbtn").href = `https://www.google.com/maps/dir/?api=1&destination=${rp[0].toFixed(6)},${rp[1].toFixed(6)}&travelmode=walking`;
+    $("coordtitle").textContent = st.landed ? "Landing position" : "Rocket position";
+  }
+  const fileAge = S.writtenSeenAt ? (Date.now() - S.writtenSeenAt) / 1000 : 0;
+  const fa = num(st.fix_age) ? st.fix_age + fileAge : null;
+  const fe = $("fixage");
+  fe.textContent = st.landed ? "" : (fa != null ? fmtAge(fa) : "");
+  fe.style.color = fa != null && fa > 3 ? "var(--amber)" : "var(--muted)";
+  $("earthbtn").style.visibility = st.kmz === false ? "hidden" : "visible";
+
+  // telemetry (V4 dashboard only)
+  const hasTel = num(st.v);
+  $("telpanel").style.display = hasTel ? "" : "none";
+  if (hasTel) {
+    $("t_agl").textContent = num(st.agl) ? `${st.agl.toFixed(0)} m` : "--";
+    $("t_vs").textContent = num(st.vs) ? `${st.vs > 1 ? "▲" : st.vs < -1 ? "▼" : ""}${Math.abs(st.vs).toFixed(1)}` : "--";
+    $("t_apo").textContent = num(st.max_agl) ? `${st.max_agl.toFixed(0)} m` : "--";
+    $("t_spd").textContent = num(st.speed_kmh) ? `${st.speed_kmh.toFixed(0)} km/h` : "--";
+    $("t_sig").textContent = num(st.rssi) ? `${st.rssi.toFixed(0)} dBm` : "--";
+    const bat = $("t_bat");
+    bat.textContent = num(st.battery) ? `${st.battery.toFixed(2)} V` : "--";
+    bat.style.color = num(st.battery) && st.battery < 3.5 ? "var(--red)" : num(st.battery) && st.battery < 3.7 ? "var(--amber)" : "";
+  }
+
+  // debug
+  $("debug").textContent =
+    `state polls ok/fail: ${S.stOk}/${S.stFail}\n` +
+    `phone GPS: ${S.me ? S.me[0].toFixed(6) + ", " + S.me[1].toFixed(6) + "  ±" + (S.meAcc || 0).toFixed(0) + " m" : "--"}\n` +
+    `heading: ${S.heading != null ? S.heading.toFixed(1) + "°" : "--"}  (${S.hdgSrc || "no compass yet"})\n` +
+    `orientation events: ${S.oriEvents}\n` +
+    `tiles loaded/failed: ${M.loaded}/${M.failed}`;
+
+  if (M.follow) fitView(false);
+  M.dirty = true;
+}
+
+// copy
+$("copybtn").addEventListener("click", async () => {
+  const rp = rocketPos(); if (!rp) return;
+  const txt = `${rp[0].toFixed(6)}, ${rp[1].toFixed(6)}`;
+  try { await navigator.clipboard.writeText(txt); toast("Copied " + txt); }
+  catch (e) { window.prompt("Copy the coordinates:", txt); }
+});
+
+// ================= MAP (canvas, no libraries) =================
+const LAYERS = {
+  sat: { url: (z, x, y) => `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`,
+         max: 19, attr: "Imagery © Esri" },
+  map: { url: (z, x, y) => `https://tile.openstreetmap.org/${z}/${x}/${y}.png`, max: 19, attr: "© OpenStreetMap contributors" },
+  radar: null,
+};
+const M = {
+  cv: $("map"), layer: "sat", hdgUp: false, follow: true,
+  lat: 0, lon: 0, z: 16, tiles: new Map(), loaded: 0, failed: 0, dirty: true, hasView: false,
+};
+try { const l = localStorage.getItem("aurora_layer"); if (l in LAYERS) M.layer = l; } catch (e) {}
+
+const TS = 256;
+function worldXY(lat, lon, z) {
+  const s = TS * Math.pow(2, z), sn = Math.sin(Math.max(-85, Math.min(85, lat)) * RAD);
+  return [(lon + 180) / 360 * s, (0.5 - Math.log((1 + sn) / (1 - sn)) / (4 * Math.PI)) * s];
+}
+function worldToLatLon(x, y, z) {
+  const s = TS * Math.pow(2, z);
+  const lon = x / s * 360 - 180;
+  const n = Math.PI - 2 * Math.PI * y / s;
+  return [Math.atan(Math.sinh(n)) / RAD, lon];
+}
+function mapPoints() {
+  const st = S.st || {}, pts = [];
+  const rp = rocketPos(); if (rp) pts.push(rp);
+  if (S.me) pts.push(S.me);
+  else if (pair(st.receiver)) pts.push(st.receiver);
+  if (pair(st.pad)) pts.push(st.pad);
+  if (Array.isArray(st.trail)) for (const p of st.trail) if (pair(p)) pts.push(p);
+  return pts;
+}
+function fitView(force) {
+  const pts = mapPoints(); if (!pts.length) return;
+  const W = M.cv.clientWidth || 300, H = M.cv.clientHeight || 300;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const p of pts) { const [x, y] = worldXY(p[0], p[1], 0); x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+  const c = worldToLatLon((x0 + x1) / 2, (y0 + y1) / 2, 0);
+  // minimum ~120 m view so GPS jitter isn't magnified
+  const mpp0 = 156543.03 * Math.cos(c[0] * RAD);   // metres per world-px at z0
+  const minSpan = 120 / mpp0;
+  let dx = Math.max(x1 - x0, minSpan), dy = Math.max(y1 - y0, minSpan);
+  if (M.hdgUp) { dx = dy = Math.hypot(dx, dy); }
+  const z = Math.log2(Math.min((W - 130) / dx, (H - 150) / dy));
+  M.lat = c[0]; M.lon = c[1]; M.z = Math.max(3, Math.min(19, z)); M.hasView = true;
+  if (force) M.dirty = true;
+}
+function getTile(z, x, y) {
+  const n = 1 << z; if (y < 0 || y >= n) return null;
+  x = ((x % n) + n) % n;
+  const key = `${M.layer}/${z}/${x}/${y}`;
+  let t = M.tiles.get(key);
+  if (!t) {
+    if (M.tiles.size > 400) { const first = M.tiles.keys().next().value; M.tiles.delete(first); }
+    const img = new Image();
+    t = { img, ok: false, bad: false };
+    img.onload = () => { t.ok = true; M.loaded++; M.dirty = true; };
+    img.onerror = () => { t.bad = true; M.failed++; M.dirty = true; };
+    img.src = LAYERS[M.layer].url(z, x, y);
+    M.tiles.set(key, t);
+  }
+  return t;
+}
+function niceStep(m) {
+  const p = Math.pow(10, Math.floor(Math.log10(m))), f = m / p;
+  return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * p;
+}
+function pill(ctx, x, y, text, color, anchorLeft) {
+  ctx.font = "800 12px DejaVu Sans, system-ui, sans-serif";
+  const w = ctx.measureText(text).width + 12, h = 20;
+  const bx = anchorLeft ? x + 12 : x - w / 2, by = y - h - 12;
+  ctx.fillStyle = "rgba(0,0,0,.82)"; ctx.fillRect(bx, by, w, h);
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.strokeRect(bx + .5, by + .5, w - 1, h - 1);
+  ctx.fillStyle = color; ctx.textBaseline = "middle"; ctx.fillText(text, bx + 6, by + h / 2 + 1);
+}
+
+function drawMap(ts) {
+  const cv = M.cv, dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) {
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    if (M.follow) fitView(false);
+  }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#050505"; ctx.fillRect(0, 0, W, H);
+  if (!M.hasView) {
+    ctx.fillStyle = "#8e8e8e"; ctx.font = "700 13px DejaVu Sans, system-ui, sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("Waiting for GPS positions...", W / 2, H / 2); ctx.textAlign = "left";
+    return;
+  }
+  const rot = (M.hdgUp && S.heading != null) ? -S.heading * RAD : 0;
+  const cosr = Math.cos(rot), sinr = Math.sin(rot);
+  const [cx, cy] = worldXY(M.lat, M.lon, M.z);
+  const P = (lat, lon) => {           // lat/lon -> screen, with rotation
+    const [x, y] = worldXY(lat, lon, M.z); const dx = x - cx, dy = y - cy;
+    return [W / 2 + dx * cosr - dy * sinr, H / 2 + dx * sinr + dy * cosr];
+  };
+  const mpp = 156543.03 * Math.cos(M.lat * RAD) / Math.pow(2, M.z);
+
+  // ---- tiles ----
+  const L = LAYERS[M.layer];
+  let anyTile = false;
+  if (L) {
+    const zi = Math.max(0, Math.min(L.max, Math.round(M.z)));
+    const sc = Math.pow(2, M.z - zi);
+    const [tcx, tcy] = worldXY(M.lat, M.lon, zi);
+    const R = Math.hypot(W, H) / 2 / sc;
+    ctx.save(); ctx.translate(W / 2, H / 2); ctx.rotate(rot);
+    for (let tx = Math.floor((tcx - R) / TS); tx <= Math.floor((tcx + R) / TS); tx++)
+      for (let ty = Math.floor((tcy - R) / TS); ty <= Math.floor((tcy + R) / TS); ty++) {
+        const t = getTile(zi, tx, ty);
+        if (t && t.ok) {
+          anyTile = true;
+          ctx.drawImage(t.img, (tx * TS - tcx) * sc, (ty * TS - tcy) * sc, TS * sc + 0.6, TS * sc + 0.6);
+        }
+      }
+    ctx.restore();
+    if (anyTile) { ctx.fillStyle = "rgba(0,0,0,.18)"; ctx.fillRect(0, 0, W, H); }   // calm the imagery a bit
+  }
+  const offline = L && !anyTile && M.failed > 0;
+  $("mapnote").textContent = offline ? "No internet for map tiles - showing radar view" : "";
+  $("maplabel").textContent = L ? (offline ? "OFFLINE" : "") : "RADAR";
+
+  // ---- radar rings around you (or the receiver) ----
+  const st = S.st || {};
+  const me = S.me || (pair(st.receiver) ? st.receiver : null);
+  const rp = rocketPos();
+  const ringC = me || rp;
+  if (ringC) {
+    const [rx, ry] = P(ringC[0], ringC[1]);
+    const step = niceStep(Math.min(W, H) / 2 / 3.2 * mpp);
+    ctx.strokeStyle = anyTile ? "rgba(255,255,255,.35)" : "rgba(255,255,255,.14)";
+    ctx.fillStyle = anyTile ? "rgba(255,255,255,.8)" : "rgba(255,255,255,.45)";
+    ctx.font = "700 10px DejaVu Sans, system-ui, sans-serif"; ctx.lineWidth = 1;
+    for (let k = 1; k <= 8; k++) {
+      const r = k * step / mpp; if (r > Math.hypot(W, H)) break;
+      ctx.beginPath(); ctx.arc(rx, ry, r, 0, 2 * Math.PI); ctx.stroke();
+      const [v, u] = fmtDist(k * step); ctx.fillText(`${v} ${u}`, rx + 4, ry - r - 3);
+    }
+    if (!anyTile) {   // cross-hair on radar
+      ctx.beginPath(); ctx.moveTo(rx - 2000 * Math.sin(-rot), ry - 2000 * Math.cos(-rot));
+      ctx.lineTo(rx + 2000 * Math.sin(-rot), ry + 2000 * Math.cos(-rot));
+      ctx.moveTo(rx - 2000 * Math.cos(rot), ry - 2000 * Math.sin(rot));
+      ctx.lineTo(rx + 2000 * Math.cos(rot), ry + 2000 * Math.sin(rot)); ctx.stroke();
+    }
+  }
+
+  // ---- rocket trail ----
+  if (Array.isArray(st.trail) && st.trail.length > 1) {
+    const pts = st.trail.filter(pair).map(p => P(p[0], p[1]));
+    if (rp) pts.push(P(rp[0], rp[1]));
+    for (const [w, c] of [[6, "rgba(0,0,0,.85)"], [3, "#ff1a2e"]]) {
+      ctx.beginPath(); ctx.lineWidth = w; ctx.strokeStyle = c; ctx.lineJoin = "round"; ctx.lineCap = "round";
+      pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.stroke();
+    }
+  }
+
+  // ---- pad ----
+  if (pair(st.pad)) {
+    const [x, y] = P(st.pad[0], st.pad[1]);
+    ctx.lineWidth = 3; ctx.strokeStyle = "#000";
+    ctx.beginPath(); ctx.moveTo(x - 7, y - 7); ctx.lineTo(x + 7, y + 7); ctx.moveTo(x + 7, y - 7); ctx.lineTo(x - 7, y + 7); ctx.stroke();
+    ctx.lineWidth = 2; ctx.strokeStyle = "#fff"; ctx.stroke();
+  }
+
+  // ---- line you -> rocket ----
+  if (me && rp) {
+    const a = P(me[0], me[1]), b = P(rp[0], rp[1]);
+    ctx.setLineDash([7, 6]); ctx.lineWidth = 2; ctx.strokeStyle = "rgba(255,255,255,.9)";
+    ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke(); ctx.setLineDash([]);
+  }
+
+  // ---- you ----
+  if (me) {
+    const [x, y] = P(me[0], me[1]);
+    if (S.me && S.meAcc && S.meAcc / mpp > 10) {   // GPS accuracy circle
+      ctx.beginPath(); ctx.arc(x, y, S.meAcc / mpp, 0, 2 * Math.PI);
+      ctx.fillStyle = "rgba(255,255,255,.08)"; ctx.fill();
+    }
+    if (S.heading != null && S.me) {                // facing cone
+      const a0 = (S.heading - 90) * RAD + rot;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.arc(x, y, 46, a0 - 0.45, a0 + 0.45); ctx.closePath();
+      const g = ctx.createRadialGradient(x, y, 4, x, y, 46);
+      g.addColorStop(0, "rgba(255,255,255,.55)"); g.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = g; ctx.fill();
+    }
+    ctx.beginPath(); ctx.arc(x, y, 8, 0, 2 * Math.PI); ctx.fillStyle = "#fff"; ctx.fill();
+    ctx.lineWidth = 3; ctx.strokeStyle = "#000"; ctx.stroke();
+  }
+
+  // ---- rocket (pulsing) ----
+  if (rp) {
+    const [x, y] = P(rp[0], rp[1]);
+    const ph = (ts % 1600) / 1600;
+    ctx.beginPath(); ctx.arc(x, y, 9 + ph * 22, 0, 2 * Math.PI);
+    ctx.strokeStyle = `rgba(255,26,46,${1 - ph})`; ctx.lineWidth = 3; ctx.stroke();
+    ctx.beginPath(); ctx.arc(x, y, 9, 0, 2 * Math.PI); ctx.fillStyle = "#ff1a2e"; ctx.fill();
+    ctx.lineWidth = 3; ctx.strokeStyle = "#fff"; ctx.stroke();
+  }
+
+  // ---- labels (always upright) ----
+  if (pair(st.pad) && !(rp && haversine(rp, st.pad) < 25 * mpp)) { const [x, y] = P(st.pad[0], st.pad[1]); pill(ctx, x, y, "PAD", "#fff"); }
+  if (me) { const [x, y] = P(me[0], me[1]); pill(ctx, x, y + 44, S.me ? "YOU" : "RECEIVER", "#fff"); }
+  if (rp) { const [x, y] = P(rp[0], rp[1]); pill(ctx, x, y, st.landed ? "LANDED" : "ROCKET", "#ff1a2e"); }
+
+  // ---- north indicator ----
+  const nx = 26, ny = H - 52;
+  ctx.save(); ctx.translate(nx, ny); ctx.rotate(rot);
+  ctx.beginPath(); ctx.arc(0, 0, 16, 0, 2 * Math.PI); ctx.fillStyle = "rgba(0,0,0,.75)"; ctx.fill();
+  ctx.strokeStyle = "#444"; ctx.lineWidth = 1; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, -12); ctx.lineTo(6, 4); ctx.lineTo(0, 1); ctx.lineTo(-6, 4); ctx.closePath();
+  ctx.fillStyle = "#ff1a2e"; ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = "#fff"; ctx.font = "800 9px DejaVu Sans, system-ui, sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("N", nx + 26, ny + 3); ctx.textAlign = "left";
+
+  // ---- scale bar ----
+  const sb = niceStep(90 * mpp), sbw = sb / mpp;
+  ctx.fillStyle = "rgba(0,0,0,.75)"; ctx.fillRect(8, H - 22, sbw + 50, 16);
+  ctx.fillStyle = "#fff"; ctx.fillRect(12, H - 12, sbw, 3);
+  ctx.font = "700 10px DejaVu Sans, system-ui, sans-serif"; ctx.textBaseline = "middle";
+  const [sv, su] = fmtDist(sb); ctx.fillText(`${sv} ${su}`, 18 + sbw, H - 13);
+
+  // ---- attribution ----
+  if (L && anyTile) {
+    ctx.font = "9px DejaVu Sans, system-ui, sans-serif"; const aw = ctx.measureText(L.attr).width;
+    ctx.fillStyle = "rgba(0,0,0,.6)"; ctx.fillRect(W - aw - 10, H - 15, aw + 10, 15);
+    ctx.fillStyle = "#ddd"; ctx.fillText(L.attr, W - aw - 5, H - 7);
+  }
+}
+
+// animation loop (~15 fps; pulse + tiles arriving)
+let lastFrame = 0;
+function loop(ts) {
+  if (ts - lastFrame > 66) { lastFrame = ts; drawMap(ts); }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ---- map controls ----
+function setSeg(segId, attr, val) {
+  for (const b of $(segId).querySelectorAll("button")) b.classList.toggle("on", b.dataset[attr] === val);
+}
+$("layerseg").addEventListener("click", e => {
+  const l = e.target.dataset.l; if (!l) return;
+  M.layer = l; M.failed = 0; M.loaded = 0; setSeg("layerseg", "l", l);
+  try { localStorage.setItem("aurora_layer", l); } catch (err) {}
+});
+$("orientseg").addEventListener("click", e => {
+  const o = e.target.dataset.o; if (!o) return;
+  M.hdgUp = o === "hdg"; setSeg("orientseg", "o", o);
+  if (M.hdgUp && S.heading == null) toast(S.started ? "No compass reading yet" : "Tap START TRACKING first");
+  if (M.follow) fitView(true);
+});
+setSeg("layerseg", "l", M.layer);
+function zoomBy(dz) { M.z = Math.max(3, Math.min(20, M.z + dz)); M.follow = false; $("fitbtn").classList.remove("primary"); }
+$("zin").onclick = () => zoomBy(1);
+$("zout").onclick = () => zoomBy(-1);
+$("fitbtn").onclick = () => { M.follow = true; $("fitbtn").classList.add("primary"); fitView(true); };
+$("fitbtn").classList.add("primary");
+
+// drag to pan, pinch to zoom
+const ptrs = new Map(); let pinch0 = null;
+M.cv.addEventListener("pointerdown", e => { M.cv.setPointerCapture(e.pointerId); ptrs.set(e.pointerId, [e.clientX, e.clientY]); });
+M.cv.addEventListener("pointermove", e => {
+  if (!ptrs.has(e.pointerId) || !M.hasView) return;
+  const prev = ptrs.get(e.pointerId); ptrs.set(e.pointerId, [e.clientX, e.clientY]);
+  if (ptrs.size === 1) {
+    let dx = e.clientX - prev[0], dy = e.clientY - prev[1];
+    if (Math.abs(dx) + Math.abs(dy) < 0.5) return;
+    const rot = (M.hdgUp && S.heading != null) ? S.heading * RAD : 0;   // undo the map rotation
+    const ux = dx * Math.cos(rot) - dy * Math.sin(rot), uy = dx * Math.sin(rot) + dy * Math.cos(rot);
+    const [cx, cy] = worldXY(M.lat, M.lon, M.z);
+    [M.lat, M.lon] = worldToLatLon(cx - ux, cy - uy, M.z);
+    M.follow = false; $("fitbtn").classList.remove("primary");
+  } else if (ptrs.size === 2) {
+    const [a, b] = [...ptrs.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+    if (pinch0) { M.z = Math.max(3, Math.min(20, M.z + Math.log2(d / pinch0))); M.follow = false; $("fitbtn").classList.remove("primary"); }
+    pinch0 = d;
+  }
+});
+const endPtr = e => { ptrs.delete(e.pointerId); if (ptrs.size < 2) pinch0 = null; };
+M.cv.addEventListener("pointerup", endPtr); M.cv.addEventListener("pointercancel", endPtr);
+M.cv.addEventListener("wheel", e => { e.preventDefault(); zoomBy(e.deltaY < 0 ? 0.5 : -0.5); }, { passive: false });
+
+// ---------------- go ----------------
+poll();
+setInterval(poll, 1000);
+setInterval(render, 1000);   // keeps ages / link status ticking between polls
+</script>
+</body>
+</html>
